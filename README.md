@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Images/spider.jpg" alt="Hellhound Spider" width="600"/>
+  <img src="Images/Spider.jpg" alt="Hellhound Spider" width="600"/>
 </p>
 
 <h1 align="center">Hellhound Spider</h1>
