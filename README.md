@@ -68,7 +68,7 @@ Without Playwright the spider falls back to pure HTTP crawling and still works o
 ## Usage
 
 ```
-python3 hellhound_spider.py <target> [options]
+python3 spider.py <target> [options]
 ```
 
 **Scan Options**
@@ -118,34 +118,34 @@ A JSON report is always auto-saved to the current directory even without `--out`
 
 ```bash
 # Basic unauthenticated scan
-python3 hellhound_spider.py https://target.com
+python3 spider.py https://target.com
 
 # Authenticated with a session cookie
-python3 hellhound_spider.py https://target.com --cookie "session=abc123; csrf=xyz"
+python3 spider.py https://target.com --cookie "session=abc123; csrf=xyz"
 
 # Authenticated with a JWT token cookie
-python3 hellhound_spider.py https://target.com --cookie "token=eyJhbGci..."
+python3 spider.py https://target.com --cookie "token=eyJhbGci..."
 
 # Authenticated with a Bearer token header
-python3 hellhound_spider.py https://target.com --auth "Bearer eyJhbGci..."
+python3 spider.py https://target.com --auth "Bearer eyJhbGci..."
 
 # Load cookies from a browser-exported cookie file
-python3 hellhound_spider.py https://target.com --cookie /path/to/cookies.txt
+python3 spider.py https://target.com --cookie /path/to/cookies.txt
 
 # Deeper crawl with verbose output
-python3 hellhound_spider.py https://target.com -d 6 --verbose
+python3 spider.py https://target.com -d 6 --verbose
 
 # Export as Burp Suite XML
-python3 hellhound_spider.py https://target.com --format burp --out burp.xml
+python3 spider.py https://target.com --format burp --out burp.xml
 
 # Export as CSV
-python3 hellhound_spider.py https://target.com --format csv --out endpoints.csv
+python3 spider.py https://target.com --format csv --out endpoints.csv
 
 # Fast scan without headless browser
-python3 hellhound_spider.py https://target.com --no-playwright
+python3 spider.py https://target.com --no-playwright
 
 # Compare two scans
-python3 hellhound_spider.py https://target.com --diff previous.json
+python3 spider.py https://target.com --diff previous.json
 ```
 
 ---
