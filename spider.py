@@ -509,6 +509,7 @@ class Config:
         self.jitter_max         = kw.get("jitter_max",         0.35)
         self.verbose            = kw.get("verbose",            False)
         self.use_playwright     = kw.get("use_playwright",     True)
+        self.enable_spa_interact = kw.get("enable_spa_interact", False)
         self.enable_probing     = kw.get("enable_probing",     True)
         self.enable_method_disc = kw.get("enable_method_disc", True)
         self.enable_graphql     = kw.get("enable_graphql",     True)
@@ -1390,10 +1391,11 @@ class RobotsParser:
 # ══════════════════════════════════════════════════════════════════════
 
 class SPAScanner:
-    def __init__(self, target_url, store, emit, cookies, extra_headers, queue, is_valid_fn):
+    def __init__(self, target_url, store, emit, cookies, extra_headers, queue, is_valid_fn, enable_spa_interact=False):
         self.target_url = target_url; self.store = store; self.emit = emit
         self.cookies = cookies; self.extra_headers = extra_headers
         self.queue = queue; self.is_valid = is_valid_fn
+        self._enable_spa_interact = enable_spa_interact
 
     async def run(self):
         if not PLAYWRIGHT_AVAILABLE:
@@ -1429,6 +1431,33 @@ class SPAScanner:
                                                 score=Conf.CONFIRMED, auth_required=auth)
                         if self.store.merge_headers(url, method, hdrs):
                             self.emit.info(f"[SPA-Headers] captured for {url}")
+                        # S2: capture POST body params
+                        if method == "POST":
+                            try:
+                                post_data = req.post_data
+                                if post_data:
+                                    try:
+                                        body_obj = json.loads(post_data)
+                                        if isinstance(body_obj, dict):
+                                            self.store.add_endpoint(
+                                                url, method="POST",
+                                                source="SPA_XHR_POST",
+                                                params=list(body_obj.keys()),
+                                                score=Conf.CONFIRMED,
+                                                auth_required=auth,
+                                            )
+                                    except Exception:
+                                        parsed_body = parse_qs(post_data)
+                                        if parsed_body:
+                                            self.store.add_endpoint(
+                                                url, method="POST",
+                                                source="SPA_XHR_POST",
+                                                params=list(parsed_body.keys()),
+                                                score=Conf.CONFIRMED,
+                                                auth_required=auth,
+                                            )
+                            except Exception:
+                                pass
                         self.emit.success(f"[SPA-XHR] {method} {url}")
                     elif rtype == "websocket":
                         self.store.add_endpoint(url, method="WS", source="SPA_WebSocket",
@@ -1438,6 +1467,59 @@ class SPAScanner:
                         self.queue.put_nowait((url, 1, "SPA_Script"))
 
                 page.on("request", on_request)
+
+                # S1: capture XHR response bodies to harvest real object IDs
+                async def on_response(resp):
+                    try:
+                        r_url    = resp.url
+                        r_method = resp.request.method or "GET"
+                        r_status = resp.status
+                        r_rtype  = resp.request.resource_type
+                        if r_rtype not in ("fetch", "xhr"):
+                            return
+                        if r_status not in range(200, 210):
+                            return
+                        ct = (resp.headers.get("content-type") or "").lower()
+                        if "json" not in ct:
+                            return
+                        body = await resp.text()
+                        if not body or len(body) > 512_000:
+                            return
+                        try:
+                            obj = json.loads(body)
+                        except Exception:
+                            return
+                        def _mine_resp(o, depth=0):
+                            if depth > 3 or not isinstance(o, dict):
+                                return
+                            for k, v in o.items():
+                                if re.match(
+                                    r'^(?:id|uid|user_?id|order_?id|basket_?id|'
+                                    r'item_?id|product_?id|address_?id|card_?id)$',
+                                    str(k), re.I
+                                ):
+                                    vstr = str(v) if v is not None else ""
+                                    if re.match(r'^\d{1,12}$', vstr):
+                                        r_key = self.store._key(r_url, r_method)
+                                        if r_key in self.store.endpoints:
+                                            ep  = self.store.endpoints[r_key]
+                                            obs = ep["observed_values"].setdefault(k, [])
+                                            if vstr not in obs:
+                                                obs.append(vstr)
+                                                self.emit.info(
+                                                    f"[SPA-ResponseID] {k}={vstr} ← {r_url}")
+                                if isinstance(v, (dict, list)):
+                                    _mine_resp(v, depth + 1)
+                        if isinstance(obj, list):
+                            for item in obj[:10]:
+                                _mine_resp(item)
+                        else:
+                            _mine_resp(obj)
+                    except Exception:
+                        pass
+
+                page.on("response", on_response)
+
                 try:
                     await page.goto(self.target_url, wait_until="networkidle", timeout=20000)
                 except Exception as e:
@@ -1449,7 +1531,14 @@ class SPAScanner:
                     await asyncio.sleep(0.5)
                 except Exception:
                     pass
-                await self._interact(page)
+                # S4: wait for SPA to fully settle before interacting
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                    await asyncio.sleep(1.0)
+                except Exception:
+                    pass
+                if self._enable_spa_interact:
+                    await self._interact(page)
                 await self._harvest_dom(page)
                 await self._harvest_hash(page)
                 await browser.close()
@@ -1458,18 +1547,73 @@ class SPAScanner:
             self.emit.warn(f"[SPA] Error: {e}")
 
     async def _interact(self, page):
-        for sel in ["button:not([disabled])","a[href]:not([href^='http'])",
-                    "[role='menuitem']","[role='tab']","[data-toggle]",".nav-item"]:
+        """
+        3-phase SPA interaction to trigger XHR calls universally.
+        Phase 1: navigation clicks to load route-based content.
+        Phase 2: fill and submit visible forms to trigger POST XHR calls.
+        Phase 3: click remaining action buttons.
+        """
+        # Phase 1: navigation
+        for sel in ["[role='menuitem']", "[role='tab']", ".nav-item",
+                    "[data-toggle]", "a[href]:not([href^='http'])"]:
             try:
-                for el in (await page.query_selector_all(sel))[:5]:
+                for el in (await page.query_selector_all(sel))[:8]:
                     try:
                         if await el.is_visible():
                             await el.click(timeout=1500)
-                            await asyncio.sleep(0.3)
+                            await asyncio.sleep(0.4)
                     except Exception:
                         pass
             except Exception:
                 pass
+
+        # Phase 2: fill and submit visible forms
+        try:
+            forms = await page.query_selector_all("form")
+            for form in forms[:5]:
+                try:
+                    if not await form.is_visible():
+                        continue
+                    inputs = await form.query_selector_all(
+                        "input[type='text'], input[type='email'], "
+                        "input[type='number'], input:not([type])"
+                    )
+                    for inp in inputs[:6]:
+                        try:
+                            itype = await inp.get_attribute("type") or "text"
+                            name  = (await inp.get_attribute("name") or "").lower()
+                            if "email" in name or itype == "email":
+                                await inp.fill("test@example.com", timeout=800)
+                            elif "quantity" in name or "qty" in name or itype == "number":
+                                await inp.fill("1", timeout=800)
+                            else:
+                                await inp.fill("test", timeout=800)
+                        except Exception:
+                            pass
+                    submit = await form.query_selector(
+                        "button[type='submit'], input[type='submit'], button:not([type])"
+                    )
+                    if submit and await submit.is_visible():
+                        await submit.click(timeout=1500)
+                        await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Phase 3: remaining action buttons
+        try:
+            for el in (await page.query_selector_all(
+                "button:not([disabled]):not([type='submit'])"
+            ))[:10]:
+                try:
+                    if await el.is_visible():
+                        await el.click(timeout=1500)
+                        await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     async def _harvest_dom(self, page):
         try:
@@ -1531,23 +1675,116 @@ class Spider:
         tech: Set[str] = set()
         srv = (headers.get("Server","") or headers.get("server","")).lower()
         xpb = (headers.get("X-Powered-By","") or headers.get("x-powered-by","")).lower()
-        if "php"          in xpb:                              tech.add("PHP")
-        if "express"      in xpb:                              tech.add("Node.js/Express")
-        if "asp.net"      in xpb:                              tech.add("ASP.NET")
-        if "nginx"        in srv:                              tech.add("Nginx")
-        if "apache"       in srv:                              tech.add("Apache")
-        if "cloudflare"   in srv:                              tech.add("Cloudflare")
-        if "_next/"       in body or "__NEXT_DATA__" in body:  tech.add("Next.js")
-        if "nuxt"         in body.lower():                     tech.add("Nuxt.js")
-        if "wp-content"   in body or "wp-json" in body:       tech.add("WordPress")
-        if "Drupal.settings" in body:                          tech.add("Drupal")
-        if "socket.io"    in body.lower():                     tech.add("Socket.IO")
-        if "react"        in body.lower() and "root" in body:  tech.add("React")
-        if "ng-version"   in body or "ng-app" in body:        tech.add("Angular")
-        if "vue"          in body.lower() and "v-app" in body: tech.add("Vue.js")
-        if headers.get("X-Shopify-Stage"):                     tech.add("Shopify")
-        for t in tech: self.store.tech_stack.add(t)
-        if tech: self.emit.always_info(f"[Tech] {', '.join(sorted(tech))}")
+        ct  = (headers.get("Content-Type","") or headers.get("content-type","")).lower()
+        body_lo = body.lower()
+
+        # ── Server / infrastructure ──────────────────────────────────────
+        if "nginx"        in srv:                               tech.add("Nginx")
+        if "apache"       in srv:                               tech.add("Apache")
+        if "cloudflare"   in srv:                               tech.add("Cloudflare")
+        if "iis"          in srv:                               tech.add("IIS")
+        if "gunicorn"     in srv:                               tech.add("Python/Gunicorn")
+        if "werkzeug"     in srv:                               tech.add("Python/Werkzeug")
+        if "jetty"        in srv:                               tech.add("Java/Jetty")
+        if "tomcat"       in srv:                               tech.add("Java/Tomcat")
+        if "lighttpd"     in srv:                               tech.add("Lighttpd")
+        if "caddy"        in srv:                               tech.add("Caddy")
+
+        # ── X-Powered-By ─────────────────────────────────────────────────
+        if "php"          in xpb:                               tech.add("PHP")
+        if "express"      in xpb:                               tech.add("Node.js/Express")
+        if "asp.net"      in xpb:                               tech.add("ASP.NET")
+        if "next.js"      in xpb:                               tech.add("Next.js")
+        if "servlet"      in xpb or "jsp"       in xpb:        tech.add("Java")
+
+        # ── Response headers (framework fingerprints) ────────────────────
+        if headers.get("X-Shopify-Stage"):                      tech.add("Shopify")
+        if headers.get("x-drupal-cache") or headers.get("X-Drupal-Cache"):
+            tech.add("Drupal")
+        if headers.get("x-pingback") or "xmlrpc.php" in body:  tech.add("WordPress")
+        if headers.get("x-generator","").lower().startswith("drupal"):
+            tech.add("Drupal")
+        if "laravel_session" in (headers.get("set-cookie","") or "").lower():
+            tech.add("Laravel")
+        if "django" in (headers.get("set-cookie","") or "").lower():
+            tech.add("Django")
+
+        # ── Body — JavaScript frameworks (strict signals only) ───────────
+        # Next.js — very specific marker
+        if "_next/" in body or "__NEXT_DATA__" in body:         tech.add("Next.js")
+
+        # Nuxt.js — specific marker
+        if "__nuxt" in body or "_nuxt/" in body:                tech.add("Nuxt.js")
+
+        # Angular (modern v2+) — use app-root + angular bundle markers
+        # ng-version appears in dev; angular.json and zone.js appear in prod
+        _is_angular = (
+            "<app-root" in body or
+            "ng-version=" in body or
+            ("zone.js" in body_lo and "angular" in body_lo) or
+            "platformBrowserDynamic" in body or
+            "BrowserModule" in body
+        )
+        if _is_angular:
+            tech.add("Angular")
+
+        # AngularJS (v1.x) — must be an actual HTML attribute, not minified string
+        if re.search(r'<[^>]+\bng-app\b', body) or re.search(r'<[^>]+\bng-controller\b', body):
+            tech.add("AngularJS")
+
+        # React — require specific React DOM markers, NOT just "react"
+        # ReactDOM.render or createRoot are definitive
+        # Exclude if Angular already detected (Angular bundles mention react in comments)
+        _is_react = (
+            "ReactDOM" in body or
+            "react-dom" in body_lo or
+            "__reactFiber" in body or
+            "__reactProps" in body or
+            ("data-reactroot" in body)
+        )
+        if _is_react and "Angular" not in tech:
+            tech.add("React")
+
+        # Vue.js — specific markers
+        if "__vue_app__" in body or "v-bind:" in body or "data-v-" in body:
+            tech.add("Vue.js")
+        elif "vue" in body_lo and "v-app" in body:
+            tech.add("Vue.js")
+
+        # Svelte
+        if "__svelte" in body or "svelte-" in body_lo:         tech.add("Svelte")
+
+        # ── Body — Backend frameworks ────────────────────────────────────
+        if "wp-content" in body or "wp-json" in body or "wp-login" in body:
+            tech.add("WordPress")
+        if "Drupal.settings" in body or "drupal.js" in body_lo:
+            tech.add("Drupal")
+        if "csrfmiddlewaretoken" in body_lo or "django" in body_lo and "__admin" in body_lo:
+            tech.add("Django")
+        if "laravel" in body_lo and ("csrf_token" in body_lo or "blade" in body_lo):
+            tech.add("Laravel")
+        if "rails-ujs" in body_lo or "data-remote=\"true\"" in body_lo:
+            tech.add("Ruby on Rails")
+        if "jsf" in body_lo and "javax.faces" in body_lo:
+            tech.add("Java/JSF")
+
+        # ── Body — Infrastructure/runtime ───────────────────────────────
+        if "socket.io" in body_lo:                              tech.add("Socket.IO")
+        if "graphql" in body_lo and ("__schema" in body or "introspection" in body_lo):
+            tech.add("GraphQL")
+
+        # ── Body — UI libraries ──────────────────────────────────────────
+        # Bootstrap — require the actual CSS class patterns used in markup
+        if re.search(r'class=["\'][^"\']*\b(?:navbar-brand|btn-primary|btn-secondary|col-md-|container-fluid)\b', body):
+            tech.add("Bootstrap")
+        if "jquery" in body_lo and ("$.ajax" in body or "$(document)" in body):
+            tech.add("jQuery")
+        if "material-icons" in body_lo or "mat-" in body_lo:   tech.add("Angular Material")
+
+        for t in tech:
+            self.store.tech_stack.add(t)
+        if tech:
+            self.emit.always_info(f"[Tech] {', '.join(sorted(tech))}")
 
     async def _check_sourcemap(self, session, js_url):
         s, _, _ = await fetch(session, "GET", js_url + ".map", self.rl)
@@ -1713,7 +1950,7 @@ class Spider:
                             if s in (401, 403):
                                 self.store.add_endpoint(url, source=source,
                                                         score=Conf.MEDIUM, auth_required=True)
-                                self.emit.always_info(f"[Auth-wall:{s}] {url}")
+                                self.emit.warn(f"[Auth-wall:{s}] {url}")
                             elif s == 200:
                                 if depth <= 1:
                                     self._detect_tech(hdrs, body, url)
@@ -1814,7 +2051,7 @@ class Spider:
                 _s, _, _t = await fetch(session, "GET", _wk_url, self.rl)
                 if _s == 200 and _t:
                     self.store.add_endpoint(_wk_url, source="WellKnown", score=Conf.LOW)
-                    self.emit.always_info(f"[.well-known] Found: {_wk_url}")
+                    self.emit.always_success(f"[.well-known] Found: {_wk_url}")
                     # Extract any URL-like paths from the body
                     for _m in re.finditer(r'(?:^|\s)((?:https?://[^\s]+|/[a-zA-Z0-9_\-/]+))', _t, re.M):
                         _path = _m.group(1).strip()
@@ -1825,7 +2062,8 @@ class Spider:
                                 self._queue_url(_full, 1, "WellKnown")
             if self.cfg.use_playwright:
                 spa = SPAScanner(self.target, self.store, self.emit, self.cookies,
-                                 self.extra_headers, self.queue, self.is_valid)
+                                 self.extra_headers, self.queue, self.is_valid,
+                                 enable_spa_interact=self.cfg.enable_spa_interact)
                 await spa.run()
             self.emit.always_info(
                 f"[Spider] Crawl started — depth={self.cfg.max_depth}, "
@@ -1984,15 +2222,16 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             f"\n{C.GR}  ── Examples ────────────────────────────────────────────────────\n\n"
-            f"  python3 hellhound_spider.py https://target.com\n"
-            f"  python3 hellhound_spider.py https://target.com --verbose\n"
-            f"  python3 hellhound_spider.py https://target.com --cookie \"s=abc; csrf=xy\"\n"
-            f"  python3 hellhound_spider.py https://target.com --cookie /path/cookies.txt\n"
-            f"  python3 hellhound_spider.py https://target.com --auth \"Bearer eyJhbGci...\"\n"
-            f"  python3 hellhound_spider.py https://target.com --depth 5 --out report.json\n"
-            f"  python3 hellhound_spider.py https://target.com --format csv --out e.csv\n"
-            f"  python3 hellhound_spider.py https://target.com --no-playwright\n"
-            f"  python3 hellhound_spider.py https://target.com --diff old.json\n"
+            f"  python3 spider.py https://target.com\n"
+            f"  python3 spider.py https://target.com --verbose\n"
+            f"  python3 spider.py https://target.com --cookie \"s=abc; csrf=xy\"\n"
+            f"  python3 spider.py https://target.com --cookie /path/cookies.txt\n"
+            f"  python3 spider.py https://target.com --auth \"Bearer eyJhbGci...\"\n"
+            f"  python3 spider.py https://target.com --depth 5 --out report.json\n"
+            f"  python3 spider.py https://target.com --format csv --out e.csv\n"
+            f"  python3 spider.py https://target.com --no-playwright\n"
+            f"  python3 spider.py https://target.com --spa-interact\n"
+            f"  python3 spider.py https://target.com --diff old.json\n"
             f"\n  JSON report is always auto-saved even without --out.{C.RST}\n"
         ),
     )
@@ -2027,6 +2266,8 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Disable headless browser SPA scanning")
     flags.add_argument("--no-probing",    action="store_true",
                        help="Disable intelligent probing phase")
+    flags.add_argument("--spa-interact", action="store_true",
+                       help="Enable SPA form filling and button clicking (use only on authorized targets)")
     flags.add_argument("--no-cors",       action="store_true",
                        help="Disable CORS misconfiguration checks")
     flags.add_argument("--no-graphql",    action="store_true",
@@ -2085,6 +2326,7 @@ def main():
         timeout         = args.timeout,
         verbose         = args.verbose,
         use_playwright  = not args.no_playwright,
+        enable_spa_interact = args.spa_interact,
         enable_probing  = not args.no_probing,
         enable_cors     = not args.no_cors,
         enable_graphql  = not args.no_graphql,

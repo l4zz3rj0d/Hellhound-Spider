@@ -1,46 +1,19 @@
 <p align="center">
-  <img src="Images/Spider.jpg" alt="Hellhound Spider" width="600"/>
+  <img src="Images/spider.jpg" alt="Hellhound Spider" width="600"/>
 </p>
 
 <h1 align="center">Hellhound Spider</h1>
 
 <p align="center">
-  Fast async web crawler for security testing — discovers endpoints, parameters, and security issues across traditional and SPA web applications.
+  Fast async web crawler for security testing — maps endpoints, parameters, and security issues across traditional and SPA web applications.
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white"/>
-  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square"/>
   <img src="https://img.shields.io/badge/version-11.2-red?style=flat-square"/>
-  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square"/>
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey?style=flat-square"/>
+  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square"/>
 </p>
-
----
-
-## What It Does
-
-Hellhound Spider maps every reachable endpoint, parameter, and security surface of a web application. It runs as a standalone CLI tool — no framework needed. Point it at a target, give it credentials if you have them, and it hands you a structured report ready for manual review or import into Burp Suite.
-
-It covers both traditional server-rendered applications and modern JavaScript-heavy SPAs. For SPAs it spins up a headless Chromium browser and intercepts actual network calls as the page runs, so endpoints that never appear in HTML are still captured. For everything else it uses async HTTP with up to 12 concurrent workers.
-
-The output is a confidence-sorted list of endpoints with discovered parameters, observed HTTP methods, auth requirements, and flagged security issues — exported as JSON, CSV, JSONL, or Burp XML.
-
----
-
-## Features
-
-- Dual-engine crawl — async HTTP + headless Chromium (Playwright) for SPA support
-- `robots.txt` parsing — disallowed paths crawled as targets, not skipped
-- Recursive sitemap.xml parsing including sitemap index files
-- GraphQL introspection probe across common paths
-- OpenAPI / Swagger spec discovery and full endpoint extraction
-- CORS misconfiguration detection
-- Source map exposure detection
-- Secret detection in JavaScript and HTML — API keys, tokens, credentials
-- HTTP method discovery per endpoint
-- Parameter sensitivity detection via baseline comparison
-- SPA request header capture for auth-aware downstream testing
-- Scan diff engine — compare two reports to find what changed
 
 ---
 
@@ -49,29 +22,51 @@ The output is a confidence-sorted list of endpoints with discovered parameters, 
 ```bash
 git clone https://github.com/l4zz3rj0d/hellhound-spider.git
 cd hellhound-spider
-pip install -r requirements.txt
+chmod +x install.sh
+./install.sh
 ```
 
-**Optional — headless browser support for SPA targets:**
+The installer handles dependencies, optionally installs Playwright for SPA support, and puts the `spider` command in your PATH. After that you call it like any system tool:
 
 ```bash
-pip install -r requirements-playwright.txt
-playwright install chromium
+spider https://target.com
 ```
 
-Without Playwright the spider falls back to pure HTTP crawling and still works on most targets. Use `--no-playwright` to force this mode explicitly.
+No `python3`, no file path, no flags you don't need.
 
-**Requirements:** Python 3.10+
+### Manual install (pip)
+
+If you prefer to manage it yourself:
+
+```bash
+pip install -e .                         # core install
+pip install -e ".[spa]"                  # with Playwright SPA support
+playwright install chromium              # download browser
+```
+
+### Uninstall
+
+```bash
+./uninstall.sh
+```
+
+---
+
+## What It Does
+
+Hellhound Spider crawls a web application and produces a complete map of every endpoint, parameter, and security surface it can reach. The output is a structured JSON report — sorted by confidence, with parameters grouped by source, ready to feed directly into attack agents or import into Burp Suite.
+
+It uses two crawl engines in parallel: async HTTP workers for speed and coverage, and headless Chromium for JavaScript-heavy SPAs that load content dynamically. For SPAs it intercepts live XHR and fetch calls as the browser actually makes them — so endpoints that never appear in HTML are still captured, including their POST body parameters and response IDs.
 
 ---
 
 ## Usage
 
 ```
-python3 spider.py <target> [options]
+spider <target> [options]
 ```
 
-**Scan Options**
+**Scan**
 
 | Flag | Default | Description |
 |---|---|---|
@@ -84,15 +79,17 @@ python3 spider.py <target> [options]
 
 | Flag | Description |
 |---|---|
-| `--cookie` | Cookie string, or path to a Netscape/JSON cookie file |
+| `--cookie` | Cookie string `"name=value; name2=value2"` or path to a cookie file |
 | `--auth` | Authorization header value e.g. `"Bearer eyJ..."` |
+
+Accepts Netscape cookie files, JSON browser exports, and inline strings. JWT tokens work regardless of length.
 
 **Output**
 
 | Flag | Default | Description |
 |---|---|---|
-| `--out` | auto | Output file path |
-| `--format` | `json` | Format: `json` `jsonl` `csv` `burp` |
+| `--out` | auto-named | Output file path |
+| `--format` | `json` | `json` `jsonl` `csv` `burp` |
 
 A JSON report is always auto-saved to the current directory even without `--out`.
 
@@ -103,8 +100,8 @@ A JSON report is always auto-saved to the current directory even without `--out`
 | `--no-playwright` | HTTP crawl only, no headless browser |
 | `--no-probing` | Skip intelligent probing phase |
 | `--no-cors` | Skip CORS checks |
-| `--no-graphql` | Skip GraphQL probe |
-| `--no-openapi` | Skip OpenAPI discovery |
+| `--no-graphql` | Skip GraphQL introspection probe |
+| `--no-openapi` | Skip OpenAPI / Swagger discovery |
 
 **Utilities**
 
@@ -117,44 +114,52 @@ A JSON report is always auto-saved to the current directory even without `--out`
 ## Examples
 
 ```bash
-# Basic unauthenticated scan
-python3 spider.py https://target.com
+# Basic scan
+spider https://target.com
 
 # Authenticated with a session cookie
-python3 spider.py https://target.com --cookie "session=abc123; csrf=xyz"
+spider https://target.com --cookie "session=abc123; csrf=xyz"
 
-# Authenticated with a JWT token cookie
-python3 spider.py https://target.com --cookie "token=eyJhbGci..."
+# Authenticated with a JWT
+spider https://target.com --cookie "token=eyJhbGci..."
 
-# Authenticated with a Bearer token header
-python3 spider.py https://target.com --auth "Bearer eyJhbGci..."
+# Authenticated with Bearer token
+spider https://target.com --auth "Bearer eyJhbGci..."
 
-# Load cookies from a browser-exported cookie file
-python3 spider.py https://target.com --cookie /path/to/cookies.txt
+# Load cookies from a browser-exported file
+spider https://target.com --cookie /path/to/cookies.txt
 
-# Deeper crawl with verbose output
-python3 spider.py https://target.com -d 6 --verbose
+# Deeper crawl, all logs visible
+spider https://target.com -d 6 --verbose
 
-# Export as Burp Suite XML
-python3 spider.py https://target.com --format burp --out burp.xml
+# Export for Burp Suite
+spider https://target.com --format burp --out burp.xml
 
 # Export as CSV
-python3 spider.py https://target.com --format csv --out endpoints.csv
+spider https://target.com --format csv --out endpoints.csv
 
-# Fast scan without headless browser
-python3 spider.py https://target.com --no-playwright
+# No headless browser
+spider https://target.com --no-playwright
 
-# Compare two scans
-python3 spider.py https://target.com --diff previous.json
+# Diff two scans
+spider https://target.com --diff previous.json
 ```
+
+---
+
+## What Gets Found
+
+**Endpoints** — HTML crawl, live SPA XHR interception, robots.txt disallowed paths, sitemap XML, `.well-known` files, JSON response path chaining, SPA hash routes, lazy-load attributes, JSON-LD.
+
+**Parameters** — Form fields (all types including hidden), JS fetch/axios body keys, URL query strings, OpenAPI spec fields, POST body params from live browser requests, JSON response key extraction, validation error message scanning.
+
+**Security issues** — GraphQL introspection, OpenAPI/Swagger spec exposure, CORS misconfiguration, source map exposure, secrets in JS/HTML (API keys, tokens, credentials, crypto addresses), auth-walled endpoints, param-sensitive endpoints.
 
 ---
 
 ## Output
 
-The JSON report contains these top-level keys: `meta`, `summary`, `endpoints`, `secrets`, `cors_issues`, `graphql`, `openapi`, `sourcemaps`, `comments`, `robots_disallowed`, `tech_stack`.
-
-Each endpoint includes its URL, discovered HTTP methods, parameters grouped by source bucket (`query`, `form`, `js`, `openapi`, `runtime`), observed status codes, auth requirement flag, and a confidence label.
+Results are printed to the terminal as a colour-coded report and saved as JSON. Each endpoint in the report includes its URL, discovered HTTP methods, parameters by source bucket, observed HTTP status codes, auth requirement flag, confidence label, and any custom request headers captured during SPA scanning.
 
 **Confidence levels:**
 
@@ -165,11 +170,21 @@ Each endpoint includes its URL, discovered HTTP methods, parameters grouped by s
 | `MEDIUM` | Found via HTML crawl, robots.txt, or sitemap |
 | `LOW` | Found via JS analysis, CSP hints, or body text hints |
 
+Output formats: `json`, `jsonl`, `csv`, `burp` (Burp Suite XML).
+
+---
+
+## Requirements
+
+- Python 3.10+
+- `aiohttp`, `beautifulsoup4`, `lxml`
+- Playwright + Chromium *(optional, for SPA targets)*
+
 ---
 
 ## Legal
 
-This tool is intended for authorized security testing only. Only use it against systems you have explicit permission to test. The author is not responsible for misuse.
+For authorized security testing only. Only use against systems you have explicit permission to test. The author is not responsible for misuse.
 
 ---
 
@@ -179,8 +194,4 @@ This tool is intended for authorized security testing only. Only use it against 
 
 [GitHub](https://github.com/l4zz3rj0d) · [Medium](https://medium.com/@l4zz3rj0d) · [TryHackMe](https://tryhackme.com/p/L4ZZ3RJ0D)
 
-
 > Also available as the recon module inside the [Hellhound](https://github.com/l4zz3rj0d/Hellhound-Pentest) pentest framework.
-
-
-

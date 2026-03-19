@@ -1,11 +1,12 @@
-# Reports — auto-saved by the spider, do not commit scan output
+# Scan reports — auto-saved by spider, never commit
 hellhound_*.json
-*.json
-*.csv
-*.xml
 *.jsonl
 
-# Cookies and credentials — never commit these
+# Explicit output files
+*.csv
+burp.xml
+
+# Credentials — never commit these
 cookies.txt
 *.cookie
 auth.txt
@@ -13,9 +14,6 @@ auth.txt
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.Python
 *.egg-info/
 dist/
 build/
