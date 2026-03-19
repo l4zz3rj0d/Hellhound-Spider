@@ -11,13 +11,15 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white"/>
   <img src="https://img.shields.io/badge/version-11.2-red?style=flat-square"/>
-  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey?style=flat-square"/>
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square"/>
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square"/>
 </p>
 
 ---
 
 ## Installation
+
+### Linux / macOS
 
 ```bash
 git clone https://github.com/l4zz3rj0d/hellhound-spider.git
@@ -32,22 +34,44 @@ The installer handles dependencies, optionally installs Playwright for SPA suppo
 spider https://target.com
 ```
 
-No `python3`, no file path, no flags you don't need.
+### Windows
 
-### Manual install (pip)
-
-If you prefer to manage it yourself:
+The bash installer doesn't run on Windows. Use pip instead:
 
 ```bash
-pip install -e .                         # core install
-pip install -e ".[spa]"                  # with Playwright SPA support
-playwright install chromium              # download browser
+git clone https://github.com/l4zz3rj0d/hellhound-spider.git
+cd hellhound-spider
+pip install -e .                    # core install
+pip install -e ".[spa]"             # with Playwright SPA support
+playwright install chromium         # download browser
+```
+
+This registers the `spider` command via pip's entry points so it works from any terminal:
+
+```bash
+spider https://target.com
+```
+
+> **Note:** Colours render correctly in Windows Terminal and PowerShell 7+. On old `cmd.exe` the output falls back to plain text automatically.
+
+### Manual install (pip) — any platform
+
+```bash
+pip install -e .                    # core install
+pip install -e ".[spa]"             # with Playwright SPA support
+playwright install chromium         # download browser
 ```
 
 ### Uninstall
 
+**Linux / macOS:**
 ```bash
 ./uninstall.sh
+```
+
+**Windows:**
+```bash
+pip uninstall hellhound-spider
 ```
 
 ---
