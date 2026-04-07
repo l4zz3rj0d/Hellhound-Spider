@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white"/>
-  <img src="https://img.shields.io/badge/version-11.2-red?style=flat-square"/>
+  <img src="https://img.shields.io/badge/version-12.0-red?style=flat-square"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square"/>
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square"/>
 </p>
@@ -28,7 +28,9 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer handles dependencies, optionally installs Playwright for SPA support, and puts the `spider` command in your PATH. After that you call it like any system tool:
+The installer automatically creates an **isolated virtual environment (`.venv`)** in the project directory. All dependencies (including Playwright) are installed within this environment to prevent conflicts with your system Python. 
+
+A binary wrapper is generated at `/usr/local/bin/spider` (or `~/.local/bin/spider`) which automatically launches the tool using the internal environment. You can run it from anywhere like any other system tool:
 
 ```bash
 spider https://target.com
@@ -76,11 +78,21 @@ pip uninstall hellhound-spider
 
 ---
 
+## v12.0 — High-Fidelity Recon
+
+The v12.0 release transitions Hellhound Spider into a professional-grade reconnaissance engine with three new core systems:
+
+1.  **Method Oracle**: Automatically discovers mandatory parameter names for REST APIs by switching methods (GET→POST) and parsing validation error bodies (400/405/422).
+2.  **Backup Prober**: Scans for exposed configuration and backup files (`.bak`, `.old`, `.env`, `.sql`) and automatically harvests secrets from them.
+3.  **Intelligence Classification**: Every discovered endpoint is automatically classified with metadata tags to feed downstream security agents.
+
+---
+
 ## What It Does
 
 Hellhound Spider crawls a web application and produces a complete map of every endpoint, parameter, and security surface it can reach. The output is a structured JSON report — sorted by confidence, with parameters grouped by source, ready to feed directly into attack agents or import into Burp Suite.
 
-It uses two crawl engines in parallel: async HTTP workers for speed and coverage, and headless Chromium for JavaScript-heavy SPAs that load content dynamically. For SPAs it intercepts live XHR and fetch calls as the browser actually makes them — so endpoints that never appear in HTML are still captured, including their POST body parameters and response IDs.
+It uses two crawl engines in parallel: async HTTP workers for speed, and headless Chromium for JavaScript-heavy SPAs. For SPAs it intercepts live XHR and fetch calls as the browser actually makes them — including POST body parameters and response IDs.
 
 ---
 
@@ -97,16 +109,16 @@ spider <target> [options]
 | `--depth`, `-d` | `4` | Maximum crawl depth |
 | `--concurrency` | `12` | Concurrent async workers |
 | `--timeout` | `15` | Per-request timeout in seconds |
-| `--verbose`, `-v` | off | Show all discovery logs |
+| `--verbose`, `-v` | off | Show all discovery logs (including Method Oracle & Backup finds) |
 
 **Authentication**
 
+Accepts Netscape cookie files, JSON browser exports, and inline strings.
+
 | Flag | Description |
 |---|---|
-| `--cookie` | Cookie string `"name=value; name2=value2"` or path to a cookie file |
+| `--cookie` | Cookie string `"name=value"` or path to a cookie file |
 | `--auth` | Authorization header value e.g. `"Bearer eyJ..."` |
-
-Accepts Netscape cookie files, JSON browser exports, and inline strings. JWT tokens work regardless of length.
 
 **Output**
 
@@ -122,7 +134,7 @@ A JSON report is always auto-saved to the current directory even without `--out`
 | Flag | Description |
 |---|---|
 | `--no-playwright` | HTTP crawl only, no headless browser |
-| `--no-probing` | Skip intelligent probing phase |
+| `--no-probing` | Skip Method Oracle and CORS probes |
 | `--no-cors` | Skip CORS checks |
 | `--no-graphql` | Skip GraphQL introspection probe |
 | `--no-openapi` | Skip OpenAPI / Swagger discovery |
@@ -173,28 +185,34 @@ spider https://target.com --diff previous.json
 
 ## What Gets Found
 
-**Endpoints** — HTML crawl, live SPA XHR interception, robots.txt disallowed paths, sitemap XML, `.well-known` files, JSON response path chaining, SPA hash routes, lazy-load attributes, JSON-LD.
+**Discovery Vectors** — HTML crawl, live SPA XHR interception, robots.txt, sitemap XML, `.well-known` (including OIDC/JWKS), JSON path chaining, SPA hash routes, lazy-load attributes.
 
-**Parameters** — Form fields (all types including hidden), JS fetch/axios body keys, URL query strings, OpenAPI spec fields, POST body params from live browser requests, JSON response key extraction, validation error message scanning.
+**Parameter Mining** — Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, POST body params from live browser requests, **Method Oracle** (error-body parsing).
 
-**Security issues** — GraphQL introspection, OpenAPI/Swagger spec exposure, CORS misconfiguration, source map exposure, secrets in JS/HTML (API keys, tokens, credentials, crypto addresses), auth-walled endpoints, param-sensitive endpoints.
+**Security Issues** — GraphQL introspection, OpenAPI/Swagger exposure, CORS misconfiguration, Source map exposure, **Exposed Backups/Configs**, **Secrets Harvesting** (API keys, credentials, JWTs).
 
 ---
 
-## Output
+## Intelligence Classification (v12.0)
 
-Results are printed to the terminal as a colour-coded report and saved as JSON. Each endpoint in the report includes its URL, discovered HTTP methods, parameters by source bucket, observed HTTP status codes, auth requirement flag, confidence label, and any custom request headers captured during SPA scanning.
+Endpoints are automatically tagged in the JSON report with intelligence metadata:
 
-**Confidence levels:**
-
-| Label | Meaning |
+| Tag | Meaning |
 |---|---|
-| `CONFIRMED` | Observed as a live browser XHR/fetch, or from an OpenAPI spec |
-| `HIGH` | Found via form action or multiple corroborating sources |
-| `MEDIUM` | Found via HTML crawl, robots.txt, or sitemap |
-| `LOW` | Found via JS analysis, CSP hints, or body text hints |
+| `admin_panel` | Management/Administration interface detected |
+| `auth_classification` | login, logout, register, token, mfa, password_reset |
+| `idor_candidate` | Endpoints with ID-like parameters or UUIDs in the path |
+| `sqli_candidate` | Parameters prone to SQL injection (id, query, filter, sort) |
+| `cmdi_candidate` | Parameters prone to Command injection (cmd, exec, file, path) |
+| `file_upload` | Endpoints for file/media ingestion |
 
-Output formats: `json`, `jsonl`, `csv`, `burp` (Burp Suite XML).
+---
+
+## Output Formats
+
+- **JSON**: Full-fidelity report with classification metadata.
+- **Burp**: XML format for direct import into Burp Suite.
+- **CSV**: Spreadsheet-ready list of endpoints and parameters.
 
 ---
 
@@ -208,7 +226,7 @@ Output formats: `json`, `jsonl`, `csv`, `burp` (Burp Suite XML).
 
 ## Legal
 
-For authorized security testing only. Only use against systems you have explicit permission to test. The author is not responsible for misuse.
+For authorized security testing only. The author is not responsible for misuse.
 
 ---
 
@@ -218,4 +236,4 @@ For authorized security testing only. Only use against systems you have explicit
 
 [GitHub](https://github.com/l4zz3rj0d) · [Medium](https://medium.com/@l4zz3rj0d) · [TryHackMe](https://tryhackme.com/p/L4ZZ3RJ0D)
 
-> Also available as the recon module inside the [Hellhound](https://github.com/l4zz3rj0d/Hellhound-Pentest) pentest framework.
+> Integrated into the [Hellhound Pentest Framework](https://github.com/l4zz3rj0d/Hellhound-Pentest).

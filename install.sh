@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-#  Hellhound Spider — Installer
-#  Installs the `spider` command system-wide so you can run it from
-#  anywhere without typing python3 or a file path.
+#  Hellhound Spider — Installer (v12.0)
+#  Installs the `spider` command with an isolated virtual environment.
 # ─────────────────────────────────────────────────────────────────────
 
 set -e
@@ -19,6 +18,14 @@ success() { echo -e "${GRN}${BLD}[✓]${RST} $1"; }
 warn()    { echo -e "${YLW}[!]${RST} $1"; }
 error()   { echo -e "${RED}[✗]${RST} $1"; exit 1; }
 
+# Parse flags
+NON_INTERACTIVE=false
+for arg in "$@"; do
+    if [[ "$arg" == "--yes" || "$arg" == "-y" || "$arg" == "--non-interactive" ]]; then
+        NON_INTERACTIVE=true
+    fi
+done
+
 echo -e "${RED}${BLD}"
 cat << 'BANNER'
               ██╗  ██╗███████╗██╗     ██╗     ██╗  ██╗ ██████╗ ██╗   ██╗███╗   ██╗██████╗
@@ -29,7 +36,7 @@ cat << 'BANNER'
               ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝
 BANNER
 echo -e "${RST}"
-echo -e "  ${CYN}Hellhound Spider v11.2${RST}  —  Installer\n"
+echo -e "  ${CYN}Hellhound Spider v12.0${RST}  —  Installer\n"
 
 # ── Check Python version ───────────────────────────────────────────────────────
 info "Checking Python version..."
@@ -46,36 +53,64 @@ if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; }
 fi
 success "Python $PY_VERSION found"
 
+# ── Virtual Environment Setup ────────────────────────────────────────────────
+info "Setting up virtual environment..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$SCRIPT_DIR/.venv"
+
+if [ ! -d "$VENV_DIR" ]; then
+    python3 -m venv "$VENV_DIR" || error "Failed to create virtual environment. Ensure 'python3-venv' is installed."
+fi
+VENV_PYTHON="$VENV_DIR/bin/python3"
+success "Virtual environment ready: $VENV_DIR"
+
 # ── Install pip dependencies ───────────────────────────────────────────────────
-info "Installing dependencies..."
-pip3 install --quiet aiohttp beautifulsoup4 lxml
+info "Installing dependencies from requirements.txt into venv..."
+"$VENV_PYTHON" -m pip install --quiet --upgrade pip
+"$VENV_PYTHON" -m pip install --quiet -r requirements.txt
 success "Core dependencies installed"
 
 # ── Optional: Playwright ───────────────────────────────────────────────────────
-echo ""
-echo -e "  ${CYN}Playwright${RST} enables headless browser scanning for SPA targets"
-echo -e "  (React, Angular, Vue, Next.js). Requires ~150MB for Chromium.\n"
-read -r -p "  Install Playwright for SPA support? [y/N] " INSTALL_PLAYWRIGHT
-echo ""
+INSTALL_PLAYWRIGHT="n"
+if [ "$NON_INTERACTIVE" = true ]; then
+    # In non-interactive mode, only install Playwright if already present
+    if "$VENV_PYTHON" -c "import playwright" &>/dev/null; then
+        INSTALL_PLAYWRIGHT="y"
+        info "Playwright detected in venv — updating..."
+    else
+        warn "Non-interactive mode: skipping Playwright installation"
+    fi
+else
+    echo ""
+    echo -e "  ${CYN}Playwright${RST} enables headless browser scanning for SPA targets"
+    echo -e "  (React, Angular, Vue, Next.js). Requires ~150MB for Chromium.\n"
+    read -r -p "  Install Playwright for SPA support? [y/N] " INSTALL_PLAYWRIGHT
+    echo ""
+fi
 
 if [[ "$INSTALL_PLAYWRIGHT" =~ ^[Yy]$ ]]; then
-    info "Installing Playwright..."
-    pip3 install --quiet playwright
-    playwright install chromium
+    info "Installing Playwright into venv..."
+    "$VENV_PYTHON" -m pip install --quiet playwright
+    "$VENV_PYTHON" -m playwright install chromium
     success "Playwright + Chromium installed"
-else
-    warn "Skipping Playwright — SPA scanning will be disabled (use --no-playwright)"
 fi
 
 # ── Install the spider command ─────────────────────────────────────────────────
-info "Installing spider command..."
+info "Installing spider command binary..."
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPIDER_SRC="$SCRIPT_DIR/spider.py"
-
 if [ ! -f "$SPIDER_SRC" ]; then
     error "spider.py not found in $SCRIPT_DIR"
 fi
+
+# Create a temporary wrapper script
+WRAPPER_TMP=$(mktemp)
+cat << EOW > "$WRAPPER_TMP"
+#!/usr/bin/env bash
+# Hellhound Spider — Wrapper Script
+# Generated on $(date)
+"$VENV_PYTHON" "$SPIDER_SRC" "\$@"
+EOW
 
 # Determine install location — prefer /usr/local/bin, fall back to ~/.local/bin
 if [ -w "/usr/local/bin" ]; then
@@ -92,12 +127,13 @@ INSTALL_PATH="$INSTALL_DIR/spider"
 
 # Copy and make executable
 if [ "${USE_SUDO:-false}" = true ]; then
-    sudo cp "$SPIDER_SRC" "$INSTALL_PATH"
+    sudo cp "$WRAPPER_TMP" "$INSTALL_PATH"
     sudo chmod +x "$INSTALL_PATH"
 else
-    cp "$SPIDER_SRC" "$INSTALL_PATH"
+    cp "$WRAPPER_TMP" "$INSTALL_PATH"
     chmod +x "$INSTALL_PATH"
 fi
+rm -f "$WRAPPER_TMP"
 
 success "Installed to $INSTALL_PATH"
 

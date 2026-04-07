@@ -40,7 +40,7 @@ except ImportError:
 # VERSION
 # ══════════════════════════════════════════════════════════════════════
 
-VERSION = "11.2"
+VERSION = "12.0"
 
 # ══════════════════════════════════════════════════════════════════════
 # TERMINAL COLOURS
@@ -710,6 +710,16 @@ class Store:
             "source": [], "confidence": 0, "confidence_label": "LOW",
             "auth_required": False, "parameter_sensitive": False,
             "observed_status": [], "baseline": None,
+            # v12.0 additions
+            "admin_panel":          False,
+            "auth_classification":  [],
+            "file_upload_candidate": False,
+            "idor_candidate":       False,
+            "idor_signals":         {},
+            "sqli_candidate":       False,
+            "sqli_params":          [],
+            "cmdi_candidate":       False,
+            "cmdi_params":          [],
         }
 
     def add_endpoint(self, url, method="GET", source="Static",
@@ -921,6 +931,13 @@ class Store:
             "openapi_exposed":     len(self.openapi),
             "sourcemaps_exposed":  len(self.sourcemaps),
             "tech_stack":          sorted(self.tech_stack),
+            # v12.0 additions
+            "admin_panels":       sum(1 for e in eps if e.get("admin_panel")),
+            "auth_endpoints":     sum(1 for e in eps if e.get("auth_classification")),
+            "upload_endpoints":   sum(1 for e in eps if e.get("file_upload_candidate")),
+            "idor_candidates":    sum(1 for e in eps if e.get("idor_candidate")),
+            "sqli_candidates":    sum(1 for e in eps if e.get("sqli_candidate")),
+            "cmdi_candidates":    sum(1 for e in eps if e.get("cmdi_candidate")),
         }
         data = {
             "meta": meta, "summary": summary, "endpoints": eps,
@@ -1221,7 +1238,13 @@ async def probe_openapi(session, base, store, emit, rl):
 # ══════════════════════════════════════════════════════════════════════
 
 class IntelligentProber:
-    _METHODS = ["OPTIONS","PUT","PATCH","DELETE","HEAD","TRACE"]
+    _METHODS = ["PUT", "PATCH", "DELETE", "HEAD", "TRACE"]
+
+    # Param names to exclude from method oracle results (form/browser noise)
+    _ORACLE_NOISE = frozenset({
+        "viewport", "description", "author", "keywords", "charset",
+        "submit", "button", "action", "method", "enctype",
+    })
 
     def __init__(self, session, store, emit, rl, cfg):
         self.session = session; self.store = store
@@ -1277,6 +1300,13 @@ class IntelligentProber:
                     self.store.update_methods(url, found)
                     self.emit.info(f"[Methods] {url} → {', '.join(found)}")
                     n_meth += 1
+
+                # BUG-4 Upgrade: Method Oracle – parse error bodies for parameter names
+                oracle_params = await self._method_oracle_params(url)
+                if oracle_params:
+                    changed = self.store.add_runtime_params(url, method, oracle_params)
+                    if changed:
+                        self.emit.info(f"[MethodOracle] Params discovered: {oracle_params} ← {url}")
             if self.cfg.enable_cors:
                 await self._cors(url)
         self.emit.always_success(f"Probing done — sensitive: {n_sens}, new methods: {n_meth}")
@@ -1306,6 +1336,95 @@ class IntelligentProber:
             sev = "HIGH" if acac else "MEDIUM"
             self.store.add_cors(url, evil, acao, acac)
             self.emit.warn(f"[CORS:{sev}] {url} — origin reflected, creds={acac}")
+
+    async def _method_oracle_params(self, url: str) -> List[str]:
+        """
+        Switch method from GET→POST and parse the error body for parameter names.
+        Returns a list of discovered parameter names (may be empty).
+        """
+        discovered = []
+
+        # Try POST with empty JSON body first (REST APIs)
+        s, _, body = await fetch(
+            self.session, "POST", url, self.rl,
+            data="{}",
+            headers={"Content-Type": "application/json"},
+        )
+        if body:
+            discovered += self._parse_oracle_body(body)
+
+        # If nothing found, try POST with empty form body (traditional apps)
+        if not discovered:
+            s2, _, body2 = await fetch(
+                self.session, "POST", url, self.rl,
+                data="",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            if body2:
+                discovered += self._parse_oracle_body(body2)
+
+        # Deduplicate and filter noise
+        seen = set()
+        result = []
+        for n in discovered:
+            nl = n.lower()
+            if nl in self._ORACLE_NOISE or nl in seen:
+                continue
+            seen.add(nl)
+            result.append(n)
+        return result
+
+    def _parse_oracle_body(self, body: str) -> List[str]:
+        """
+        Extract parameter names from error/validation response bodies.
+        Handles JSON structured errors AND plain text error messages.
+        """
+        found = []
+
+        # --- JSON structured errors ---
+        try:
+            obj = json.loads(body)
+            def _mine(o, depth=0):
+                if depth > 4:
+                    return
+                if isinstance(o, dict):
+                    for k, v in o.items():
+                        # FastAPI/Pydantic loc arrays
+                        if k == "loc" and isinstance(v, list):
+                            for item in v:
+                                if isinstance(item, str) and item not in ("body","query","path","__root__"):
+                                    found.append(item)
+                        # Missing/required arrays
+                        elif k in ("missing","required","fields","params","parameters","expected") and isinstance(v, list):
+                            for item in v:
+                                if isinstance(item, str) and len(item) <= 60:
+                                    found.append(item)
+                        # Nested error objects: {"errors": {"fieldname": "msg"}}
+                        elif k in ("errors","error","validation","detail") and isinstance(v, dict):
+                            found.extend(vk for vk in v.keys() if isinstance(vk, str))
+                        elif isinstance(v, (dict, list)):
+                            _mine(v, depth + 1)
+                elif isinstance(o, list):
+                    for item in o:
+                        _mine(item, depth + 1)
+            _mine(obj)
+        except Exception:
+            pass
+
+        # --- Plain text / HTML error messages ---
+        text_patterns = [
+            r"""(?:missing|required|invalid|unknown|bad)\s+(?:field|param|parameter|key|argument)[:\s]+["']?([a-zA-Z_][a-zA-Z0-9_]{2,40})["']?""",
+            r"""["']([a-zA-Z_][a-zA-Z0-9_]{2,40})["']\s+(?:is required|is missing|not found|is invalid|cannot be blank)""",
+            r"""(?:field|param|parameter|argument)[:\s]+["']?([a-zA-Z_][a-zA-Z0-9_]{2,40})["']?""",
+            r"""(?:provide|supply|include|send)\s+(?:a\s+)?["']?([a-zA-Z_][a-zA-Z0-9_]{2,40})["']?""",
+        ]
+        for pat in text_patterns:
+            for m in re.finditer(pat, body, re.I):
+                n = m.group(1).strip()
+                if n and len(n) <= 60:
+                    found.append(n)
+
+        return found
 
 # ══════════════════════════════════════════════════════════════════════
 # ROBOTS + SITEMAP PARSER
@@ -1644,6 +1763,164 @@ class SPAScanner:
 # CORE SPIDER
 # ══════════════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════════════
+# RECON UTILITIES (v12.0)
+# ══════════════════════════════════════════════════════════════════════
+
+_BACKUP_SUFFIXES = [".bak", ".old", ".orig", ".backup", ".tmp",
+                    ".swp", ".save", "~", ".copy", ".1", ".2"]
+_BACKUP_PATHS    = [
+    "/backup.sql", "/dump.sql", "/database.sql", "/db.sql",
+    "/backup.zip", "/site.zip", "/www.tar.gz",
+    "/.git/HEAD", "/.git/config", "/.svn/entries",
+    "/.env", "/.env.bak", "/.env.local", "/.env.production",
+    "/config.php.bak", "/wp-config.php.bak",
+    "/web.config.bak", "/application.yml.bak",
+    "/id_rsa", "/id_rsa.pub", "/.ssh/id_rsa",
+]
+
+_ADMIN_PATTERNS = re.compile(
+    r'/(?:admin|administrator|administration|manage|management|manager|'
+    r'dashboard|control|panel|backend|backoffice|back-office|'
+    r'staff|internal|superuser|root|god|devops|ops|'
+    r'phpmyadmin|pma|adminer|pgadmin|dbadmin|'
+    r'wp-admin|wp-login|cpanel|whm|plesk|'
+    r'kibana|grafana|jenkins|sonarqube|portainer|traefik|'
+    r'swagger|api-docs|graphiql|playground)(?:/|$)',
+    re.I
+)
+
+_AUTH_PATTERNS = {
+    "login":          re.compile(r'/(?:login|signin|sign-in|auth/login|oauth/login)', re.I),
+    "logout":         re.compile(r'/(?:logout|signout|sign-out|auth/logout)', re.I),
+    "register":       re.compile(r'/(?:register|signup|sign-up|create.?account|new.?user)', re.I),
+    "token":          re.compile(r'/(?:token|oauth/token|auth/token|refresh.?token|access.?token)', re.I),
+    "password_reset": re.compile(r'/(?:password.?reset|forgot.?password|reset.?password|recover)', re.I),
+    "mfa":            re.compile(r'/(?:mfa|2fa|otp|totp|verify|confirm)', re.I),
+}
+
+_NUMERIC_ID_RE = re.compile(r'(?:^|[_\-/])(?:id|uid|user_id|order_id|item_id|record_id|object_id)$', re.I)
+_PATH_ID_RE    = re.compile(r'/\d{1,12}(?:/|$)')
+_UUID_PATH_RE  = re.compile(r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
+
+_SQLI_PARAM_RE  = re.compile(r'^(?:id|uid|search|q|query|filter|order|sort|page|limit|'
+                               r'category|type|name|user|username|email|product|item|'
+                               r'start|end|from|to|where|group|having)$', re.I)
+_CMDI_PARAM_RE  = re.compile(r'^(?:cmd|command|exec|run|shell|ping|host|ip|addr|address|'
+                               r'url|uri|target|dest|src|source|file|path|dir|input|arg)$', re.I)
+
+_WELL_KNOWN_PATHS = [
+    "/.well-known/security.txt",
+    "/.well-known/change-password",
+    "/.well-known/openid-configuration",   # OAuth/OIDC discovery
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/webfinger",
+    "/.well-known/jwks.json",              # JWT public keys — feeds JWT config checker
+    "/.well-known/assetlinks.json",        # Android app links
+    "/.well-known/apple-app-site-association",
+    "/.well-known/mta-sts.txt",
+    "/.well-known/dnt-policy.txt",
+]
+
+class BackupProber:
+    def __init__(self, session, target, store: Store, emit: Emit, rl):
+        self.session = session
+        self.target  = target
+        self.store   = store
+        self.emit    = emit
+        self.rl      = rl
+
+    async def run(self):
+        self.emit.always_info("[Backup] Probing for exposed backup/config files…")
+        found = 0
+        for path in _BACKUP_PATHS:
+            url = urljoin(self.target, path)
+            s, hdrs, body = await fetch(self.session, "GET", url, self.rl)
+            if s == 200 and body and len(body) > 10:
+                ct = (hdrs or {}).get("content-type", "").lower()
+                # Avoid false positives from HTML error pages returned as 200
+                if "text/html" in ct and "<html" in body.lower():
+                    continue
+                self.store.add_endpoint(url, source="Backup_Probe", score=Conf.CONFIRMED)
+                self.emit.warn(f"[BACKUP] Exposed: {url}  ({len(body)} bytes)")
+                Extractor.secrets(body, url, self.store, self.emit)
+                found += 1
+        # Also try .bak suffix on all confirmed endpoints
+        for ep in self.store.all_endpoints():
+            if ep.get("confidence_label") in ("CONFIRMED", "HIGH"):
+                base_url = ep["url"].split("?")[0]
+                for suf in _BACKUP_SUFFIXES:
+                    bak_url = base_url + suf
+                    # Skip already probed base paths
+                    if bak_url in [e["url"] for e in self.store.endpoints.values()]:
+                        continue
+                    s, _, body = await fetch(self.session, "GET", bak_url, self.rl)
+                    if s == 200 and body and len(body) > 10:
+                        self.store.add_endpoint(bak_url, source="Backup_Suffix",
+                                                score=Conf.CONFIRMED)
+                        self.emit.warn(f"[BACKUP-SUFFIX] Exposed: {bak_url}")
+                        Extractor.secrets(body, bak_url, self.store, self.emit)
+                        found += 1
+        if found:
+            self.emit.always_success(f"[Backup] {found} exposed files found")
+
+def classify_admin_endpoints(store: Store):
+    for ep in store.endpoints.values():
+        if _ADMIN_PATTERNS.search(ep["url"]):
+            ep["admin_panel"] = True
+
+def classify_auth_endpoints(store: Store):
+    for ep in store.endpoints.values():
+        for label, pat in _AUTH_PATTERNS.items():
+            if pat.search(ep["url"]):
+                ep.setdefault("auth_classification", [])
+                if label not in ep["auth_classification"]:
+                    ep["auth_classification"].append(label)
+
+def classify_idor_candidates(store: Store):
+    for ep in store.endpoints.values():
+        url = ep["url"]
+        all_params = []
+        for b in ("query", "form", "js", "openapi", "runtime"):
+            all_params += ep.get("params", {}).get(b, [])
+        has_id_param = any(_NUMERIC_ID_RE.search(p) for p in all_params)
+        has_id_path  = bool(_PATH_ID_RE.search(url) or _UUID_PATH_RE.search(url))
+        if has_id_param or has_id_path:
+            ep["idor_candidate"] = True
+            ep["idor_signals"] = {
+                "id_params":   [p for p in all_params if _NUMERIC_ID_RE.search(p)],
+                "has_id_path": has_id_path,
+            }
+
+def score_injection_candidates(store: Store):
+    for ep in store.endpoints.values():
+        all_params = []
+        for b in ("query", "form", "js", "openapi", "runtime"):
+            all_params += ep.get("params", {}).get(b, [])
+        sqli_params = [p for p in all_params if _SQLI_PARAM_RE.match(p)]
+        cmdi_params = [p for p in all_params if _CMDI_PARAM_RE.match(p)]
+        if sqli_params:
+            ep["sqli_candidate"]  = True
+            ep["sqli_params"]     = sqli_params
+        if cmdi_params:
+            ep["cmdi_candidate"]  = True
+            ep["cmdi_params"]     = cmdi_params
+
+def _flag_upload_endpoints(store: Store):
+    upload_re = re.compile(
+        r'/(?:upload|uploads|file|files|media|attachment|attachments|'
+        r'import|ingest|document|documents|image|images|avatar|photo|'
+        r'asset|assets|storage|blob|chunk|multipart)',
+        re.I
+    )
+    for ep in store.endpoints.values():
+        if upload_re.search(ep["url"]):
+            ep["file_upload_candidate"] = True
+        if any("file" in p.lower() or "upload" in p.lower()
+               for p in ep.get("params", {}).get("form", [])):
+            ep["file_upload_candidate"] = True
+
 class Spider:
     def __init__(self, target, cfg, emit, cookies, extra_headers):
         self.target = target; self.cfg = cfg; self.emit = emit
@@ -1781,10 +2058,11 @@ class Spider:
             tech.add("jQuery")
         if "material-icons" in body_lo or "mat-" in body_lo:   tech.add("Angular Material")
 
+        new_tech = tech - self.store.tech_stack
         for t in tech:
             self.store.tech_stack.add(t)
-        if tech:
-            self.emit.always_info(f"[Tech] {', '.join(sorted(tech))}")
+        if new_tech:
+            self.emit.always_info(f"[Tech] {', '.join(sorted(new_tech))}")
 
     async def _check_sourcemap(self, session, js_url):
         s, _, _ = await fetch(session, "GET", js_url + ".map", self.rl)
@@ -1845,8 +2123,20 @@ class Spider:
                 n = nm.group(1)
                 if n not in found:
                     found.append(n)
+        # Filter known meta-noise and og:/twitter: prefixed names
+        _META_NOISE = frozenset({
+            "viewport", "description", "author", "keywords", "robots", "theme-color",
+            "generator", "referrer", "rating", "revisit-after", "copyright",
+            "application-name", "msapplication-tilecolor", "msapplication-config",
+            "format-detection", "apple-mobile-web-app-capable",
+            "apple-mobile-web-app-status-bar-style", "apple-mobile-web-app-title",
+            "og", "twitter",
+        })
         for m in re.finditer(r"""name=["']([a-zA-Z_][a-zA-Z0-9_]{2,40})["']""", body):
             n = m.group(1)
+            nl = n.lower()
+            if nl in _META_NOISE or nl.startswith(("og:", "twitter:")):
+                continue
             if n not in found:
                 found.append(n)
         if found:
@@ -2016,6 +2306,27 @@ class Spider:
                         self.cfg.jitter_min, self.cfg.jitter_max)
                     await asyncio.sleep(delay)
 
+    async def _probe_oidc(self, session, base):
+        url = urljoin(base, "/.well-known/openid-configuration")
+        s, _, text = await fetch(session, "GET", url, self.rl)
+        if s != 200 or not text:
+            return
+        try:
+            cfg = json.loads(text)
+        except Exception:
+            return
+        oidc_keys = [
+            "authorization_endpoint", "token_endpoint", "userinfo_endpoint",
+            "end_session_endpoint", "introspection_endpoint", "revocation_endpoint",
+            "jwks_uri", "registration_endpoint",
+        ]
+        for key in oidc_keys:
+            ep_url = cfg.get(key)
+            if ep_url and isinstance(ep_url, str):
+                self.store.add_endpoint(ep_url, source="OIDC_Discovery", score=Conf.CONFIRMED,
+                                        auth_required=True)
+                self.emit.always_success(f"[OIDC] {key}: {ep_url}")
+
     async def run(self):
         req_headers = {
             "User-Agent": self.cfg.user_agent,
@@ -2045,13 +2356,17 @@ class Spider:
                     if _s == 200 and _t:
                         await robots.parse_sitemap(_smap_url)
 
-            # Fix 5: probe .well-known/security.txt and .well-known/change-password
-            for _wk in ("/.well-known/security.txt", "/.well-known/change-password"):
+            # Fix 5: Expanded well-known paths (v12.0)
+            for _wk in _WELL_KNOWN_PATHS:
                 _wk_url = urljoin(self.target, _wk)
                 _s, _, _t = await fetch(session, "GET", _wk_url, self.rl)
                 if _s == 200 and _t:
                     self.store.add_endpoint(_wk_url, source="WellKnown", score=Conf.LOW)
                     self.emit.always_success(f"[.well-known] Found: {_wk_url}")
+                    
+                    if _wk.endswith("openid-configuration"):
+                        await self._probe_oidc(session, self.target)
+
                     # Extract any URL-like paths from the body
                     for _m in re.finditer(r'(?:^|\s)((?:https?://[^\s]+|/[a-zA-Z0-9_\-/]+))', _t, re.M):
                         _path = _m.group(1).strip()
@@ -2078,6 +2393,18 @@ class Spider:
             if self.cfg.enable_probing:
                 prober = IntelligentProber(session, self.store, self.emit, self.rl, self.cfg)
                 await prober.run()
+
+                # v12.0 Upgrades: Active Probes & Classification
+                backup_probe = BackupProber(session, self.target, self.store, self.emit, self.rl)
+                await backup_probe.run()
+
+                # Run classification passes
+                # No network I/O — pure store operations
+                classify_admin_endpoints(self.store)
+                classify_auth_endpoints(self.store)
+                classify_idor_candidates(self.store)
+                score_injection_candidates(self.store)
+                _flag_upload_endpoints(self.store)
 
 # ══════════════════════════════════════════════════════════════════════
 # DIFF ENGINE

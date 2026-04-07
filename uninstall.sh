@@ -35,6 +35,14 @@ for LOC in "${LOCATIONS[@]}"; do
     fi
 done
 
+# ── Cleanup Virtual Environment ──────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -d "$SCRIPT_DIR/.venv" ]; then
+    info "Removing virtual environment..."
+    rm -rf "$SCRIPT_DIR/.venv"
+    success "Removed $SCRIPT_DIR/.venv"
+fi
+
 if [ "$FOUND" = false ]; then
     error "spider command not found in any standard location"
 fi
