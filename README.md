@@ -28,9 +28,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer automatically creates an **isolated virtual environment (`.venv`)** in the project directory. All dependencies (including Playwright) are installed within this environment to prevent conflicts with your system Python. 
-
-A binary wrapper is generated at `/usr/local/bin/spider` (or `~/.local/bin/spider`) which automatically launches the tool using the internal environment. You can run it from anywhere like any other system tool:
+The installer creates an isolated virtual environment (`.venv`) and a system-wide `spider` wrapper:
 
 ```bash
 spider https://target.com
@@ -38,53 +36,31 @@ spider https://target.com
 
 ### Windows
 
-The bash installer doesn't run on Windows. Use pip instead:
-
 ```bash
 git clone https://github.com/l4zz3rj0d/hellhound-spider.git
 cd hellhound-spider
 pip install -e .                    # core install
 pip install -e ".[spa]"             # with Playwright SPA support
-playwright install chromium         # download browser
-```
-
-This registers the `spider` command via pip's entry points so it works from any terminal:
-
-```bash
-spider https://target.com
-```
-
-> **Note:** Colours render correctly in Windows Terminal and PowerShell 7+. On old `cmd.exe` the output falls back to plain text automatically.
-
-### Manual install (pip) — any platform
-
-```bash
-pip install -e .                    # core install
-pip install -e ".[spa]"             # with Playwright SPA support
-playwright install chromium         # download browser
+playwright install chromium
 ```
 
 ### Uninstall
 
-**Linux / macOS:**
 ```bash
-./uninstall.sh
-```
-
-**Windows:**
-```bash
-pip uninstall hellhound-spider
+./uninstall.sh           # Linux / macOS
+pip uninstall hellhound-spider   # Windows
 ```
 
 ---
 
 ## v12.0 — High-Fidelity Recon
 
-The v12.0 release transitions Hellhound Spider into a professional-grade reconnaissance engine with three new core systems:
+The v12.0 release transitions Hellhound Spider into a professional-grade reconnaissance engine with the following core systems:
 
-1.  **Method Oracle**: Automatically discovers mandatory parameter names for REST APIs by switching methods (GET→POST) and parsing validation error bodies (400/405/422).
-2.  **Backup Prober**: Scans for exposed configuration and backup files (`.bak`, `.old`, `.env`, `.sql`) and automatically harvests secrets from them.
-3.  **Intelligence Classification**: Every discovered endpoint is automatically classified with metadata tags to feed downstream security agents.
+1. **Method Oracle**: Automatically discovers mandatory parameter names for REST APIs by switching methods (GET→POST) and parsing validation error bodies.
+2. **Backup Prober**: Scans for exposed configuration and backup files (`.bak`, `.old`, `.env`, `.sql`, `.git/HEAD`) with a strict HTML content-type guard to eliminate SPA false positives.
+3. **Passive File Extraction**: Extracts references to sensitive file extensions (`.log`, `.bak`, `.sql`, `.env`, `.yaml`) directly from crawled HTML/JS without any active probing.
+4. **Intelligence Classification**: Every discovered endpoint is automatically tagged with security metadata to feed downstream attack modules.
 
 ---
 
@@ -109,11 +85,9 @@ spider <target> [options]
 | `--depth`, `-d` | `4` | Maximum crawl depth |
 | `--concurrency` | `12` | Concurrent async workers |
 | `--timeout` | `15` | Per-request timeout in seconds |
-| `--verbose`, `-v` | off | Show all discovery logs (including Method Oracle & Backup finds) |
+| `--verbose`, `-v` | off | Show all discovery logs |
 
 **Authentication**
-
-Accepts Netscape cookie files, JSON browser exports, and inline strings.
 
 | Flag | Description |
 |---|---|
@@ -126,8 +100,6 @@ Accepts Netscape cookie files, JSON browser exports, and inline strings.
 |---|---|---|
 | `--out` | auto-named | Output file path |
 | `--format` | `json` | `json` `jsonl` `csv` `burp` |
-
-A JSON report is always auto-saved to the current directory even without `--out`.
 
 **Feature Flags**
 
@@ -171,9 +143,6 @@ spider https://target.com -d 6 --verbose
 # Export for Burp Suite
 spider https://target.com --format burp --out burp.xml
 
-# Export as CSV
-spider https://target.com --format csv --out endpoints.csv
-
 # No headless browser
 spider https://target.com --no-playwright
 
@@ -185,17 +154,27 @@ spider https://target.com --diff previous.json
 
 ## What Gets Found
 
-**Discovery Vectors** — HTML crawl, live SPA XHR interception, robots.txt, sitemap XML, `.well-known` (including OIDC/JWKS), JSON path chaining, SPA hash routes, lazy-load attributes.
+### Discovery Vectors
+HTML crawl, live SPA XHR interception, robots.txt, sitemap XML, `.well-known` (OIDC/JWKS), JSON path chaining, SPA hash routes, lazy-load attributes, CSP header hints.
 
-**Parameter Mining** — Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, POST body params from live browser requests, **Method Oracle** (error-body parsing).
+### Parameter Mining
+Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, POST body params from live browser requests, **Method Oracle** (error-body parsing), JSON top-level key inference.
 
-**Security Issues** — GraphQL introspection, OpenAPI/Swagger exposure, CORS misconfiguration, Source map exposure, **Exposed Backups/Configs**, **Secrets Harvesting** (API keys, credentials, JWTs).
+### Passive Security Detection
 
----
+| Signal | Description |
+|---|---|
+| `[SECRET:*]` | API keys, JWTs, Bitcoin/Ethereum addresses, private keys |
+| `[Leaked-File]` | References to `.log`, `.bak`, `.sql`, `.env`, `.yaml` in page content |
+| `[BACKUP]` | Confirmed exposed backup/config files via targeted probe |
+| `[SourceMap]` | Exposed `.js.map` files leaking original source code |
+| `[Tech]` | Server/version headers (Server, X-Powered-By, X-AspNet-Version) |
+| `[CORS]` | Wildcard or reflected CORS misconfiguration |
+| `[Error-Leak]` | Verbose stack traces or DB errors in 5xx responses |
+| `[Geo-Leak]` | Latitude/longitude coordinates exposed in JSON API responses |
+| `[Auth-wall:*]` | Endpoints requiring authentication (401/403) |
 
-## Intelligence Classification (v12.0)
-
-Endpoints are automatically tagged in the JSON report with intelligence metadata:
+### Intelligence Classification (v12.0)
 
 | Tag | Meaning |
 |---|---|
@@ -204,7 +183,26 @@ Endpoints are automatically tagged in the JSON report with intelligence metadata
 | `idor_candidate` | Endpoints with ID-like parameters or UUIDs in the path |
 | `sqli_candidate` | Parameters prone to SQL injection (id, query, filter, sort) |
 | `cmdi_candidate` | Parameters prone to Command injection (cmd, exec, file, path) |
-| `file_upload` | Endpoints for file/media ingestion |
+| `file_upload` | Endpoints that accept file or media upload |
+
+---
+
+## Summary Output
+
+The terminal summary separates crawled intelligence from backup probe results:
+
+```
+│  Crawled Endpoints      104
+│  Confirmed               31
+│  High Confidence          2
+│  Auth-Walled             18
+│  Param-Sensitive         17
+│  Backup Files Found       0    ← targeted probes only, no SPA false positives
+│  Secrets Found            5
+│  CORS Issues             98
+│  SourceMaps Exposed       5
+│  Tech Stack           Angular, Socket.IO
+```
 
 ---
 
