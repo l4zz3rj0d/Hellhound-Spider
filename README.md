@@ -187,25 +187,6 @@ Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, P
 
 ---
 
-## Summary Output
-
-The terminal summary separates crawled intelligence from backup probe results:
-
-```
-│  Crawled Endpoints      104
-│  Confirmed               31
-│  High Confidence          2
-│  Auth-Walled             18
-│  Param-Sensitive         17
-│  Backup Files Found       0    ← targeted probes only, no SPA false positives
-│  Secrets Found            5
-│  CORS Issues             98
-│  SourceMaps Exposed       5
-│  Tech Stack           Angular, Socket.IO
-```
-
----
-
 ## Output Formats
 
 - **JSON**: Full-fidelity report with classification metadata.
