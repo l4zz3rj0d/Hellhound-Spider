@@ -283,15 +283,19 @@ def print_results(intel: dict, target: str, elapsed: float,
         print(f"  {C.R}{C.B}  SCAN COMPLETE{C.RST}  {C.GR}·{C.RST}  {C.W}{tgt}{C.RST}")
         print(f"  {C.R}{C.B}{bar}{C.RST}")
 
-    # ── summary ───────────────────────────────────────────────────────
+    # -- summary
+    _NOISE_SRCS = frozenset({"Backup_Probe", "Backup_Suffix", "WellKnown", "Leaked_File"})
+    _real_eps   = [e for e in eps if not all(src in _NOISE_SRCS for src in e.get("source", ["Crawl"]))]
+    _backup_eps = [e for e in eps if all(src in _NOISE_SRCS for src in e.get("source", ["Crawl"]))]
     emit.section("SUMMARY")
     emit.row("Target",             target)
     emit.row("Scan Time",          f"{elapsed:.1f}s")
-    emit.row("Total Endpoints",    _good(s.get("total_endpoints", 0)))
-    emit.row("Confirmed",          _good(s.get("confirmed", 0)))
-    emit.row("High Confidence",    _good(s.get("high", 0)))
+    emit.row("Crawled Endpoints",  _good(len(_real_eps)))
+    emit.row("Confirmed",          _good(sum(1 for e in _real_eps if e.get("confidence_label") == "CONFIRMED")))
+    emit.row("High Confidence",    _good(sum(1 for e in _real_eps if e.get("confidence_label") == "HIGH")))
     emit.row("Auth-Walled",        _good(s.get("auth_required", 0)),    value_colour=C.CY)
     emit.row("Param-Sensitive",    _good(s.get("parameter_sensitive", 0)), value_colour=C.Y)
+    emit.row("Backup Files Found", _bad(len(_backup_eps)))
     emit.row("Secrets Found",      _bad(s.get("secrets", 0)))
     emit.row("CORS Issues",        _bad(s.get("cors_issues", 0)))
     emit.row("GraphQL Exposed",    _bad(s.get("graphql_exposed", 0)))
@@ -351,9 +355,19 @@ def print_results(intel: dict, target: str, elapsed: float,
             print(f"  {C.RD}│{C.RST}  {C.GR}{'─'*66}{C.RST}")
 
         order = {"CONFIRMED": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-        sorted_eps = sorted(eps, key=lambda e: (
+        _NOISE_SOURCES = frozenset({"Backup_Probe", "Backup_Suffix", "WellKnown", "Leaked_File"})
+        # Separate real crawled EPs from backup-probe EPs for display
+        real_eps = [
+            e for e in eps
+            if not all(s in _NOISE_SOURCES for s in e.get("source", ["Crawl"]))
+        ]
+        backup_eps = [
+            e for e in eps
+            if all(s in _NOISE_SOURCES for s in e.get("source", ["Crawl"]))
+        ]
+        sorted_eps = sorted(real_eps, key=lambda e: (
             order.get(e.get("confidence_label", "LOW"), 4), e.get("url", "")
-        ))
+        )) + sorted(backup_eps, key=lambda e: e.get("url", ""))
         shown    = sorted_eps[:200]
         overflow = len(sorted_eps) - len(shown)
 
@@ -367,11 +381,11 @@ def print_results(intel: dict, target: str, elapsed: float,
                 print(f"  {C.RD}│{C.RST}  {C.GR}  … {overflow} more — see JSON report{C.RST}")
 
         # ── param map for interesting endpoints ──────────────────────
+        # Only consider real crawled endpoints (not backup probe noise)
         interesting = [
-            e for e in sorted_eps
-            if (e.get("confidence_label") in ("CONFIRMED","HIGH")
-                or e.get("parameter_sensitive")
-                or any(e.get("params",{}).get(b) for b in ("form","js","openapi","query")))
+            e for e in real_eps
+            if (any(e.get("params",{}).get(b) for b in ("form","js","openapi","query","runtime"))
+                or e.get("parameter_sensitive"))
         ][:40]
 
         if interesting:
@@ -1104,6 +1118,21 @@ class Extractor:
                     continue
                 if store.add_secret(val, stype, url):
                     emit.warn(f"[SECRET:{stype}] {val[:80]}")
+
+    @classmethod
+    def exposed_files(cls, text, base_url, store, emit):
+        # Passive discovery of common backend/backup/config extensions
+        _EXPOSED_RE = r'(?:https?://|//|/)[a-zA-Z0-9_\-\.\/]*\.(?:log|bak|sql|old|txt|zip|tar\.gz|env|json|xml|yml|yaml|ini|conf)\b'
+        _seen = set()
+        for m in re.finditer(_EXPOSED_RE, text, re.I):
+            raw = m.group(0)
+            if raw in _seen: continue
+            _seen.add(raw)
+            if raw.startswith("//"): full = "http:" + raw
+            elif raw.startswith("/"): full = urljoin(base_url, raw)
+            else: full = raw
+            store.add_endpoint(full, source="Leaked_File", score=Conf.MEDIUM)
+            emit.info(f"[Leaked-File] {full}")
 
     @classmethod
     def js_endpoints(cls, text, base_url, store, emit):
@@ -1846,24 +1875,43 @@ class BackupProber:
                 self.emit.warn(f"[BACKUP] Exposed: {url}  ({len(body)} bytes)")
                 Extractor.secrets(body, url, self.store, self.emit)
                 found += 1
-        # Also try .bak suffix on all confirmed endpoints
-        for ep in self.store.all_endpoints():
-            if ep.get("confidence_label") in ("CONFIRMED", "HIGH"):
-                base_url = ep["url"].split("?")[0]
-                for suf in _BACKUP_SUFFIXES:
-                    bak_url = base_url + suf
-                    # Skip already probed base paths
-                    if bak_url in [e["url"] for e in self.store.endpoints.values()]:
+        # Suffix sweep: only apply to REAL crawled endpoints (not backup/well-known sources)
+        # and only to paths that look like plain API/file paths (no existing ext like .bak/.env)
+        _SKIP_SOURCES = frozenset({"Backup_Probe", "Backup_Suffix", "WellKnown", "Leaked_File"})
+        _EXT_RE = re.compile(r'\.(bak|old|backup|env|sql|zip|tar|gz|swp|tmp|copy|orig|log|conf|ini|yml|yaml)$', re.I)
+        for ep in list(self.store.all_endpoints()):
+            if ep.get("confidence_label") not in ("CONFIRMED", "HIGH"):
+                continue
+            # Skip endpoints added by backup/surface probers themselves
+            if any(s in _SKIP_SOURCES for s in ep.get("source", [])):
+                continue
+            base_url = ep["url"].split("?")[0].rstrip("/")
+            # Skip if the path already ends with a backup-like extension
+            if _EXT_RE.search(base_url):
+                continue
+            # Skip bare-root or very short paths
+            path_part = urlparse(base_url).path
+            if not path_part or path_part in ("/", ""):
+                continue
+            for suf in _BACKUP_SUFFIXES:
+                bak_url = base_url + suf
+                if bak_url in [e["url"] for e in self.store.endpoints.values()]:
+                    continue
+                s, hdrs, body = await fetch(self.session, "GET", bak_url, self.rl)
+                if s == 200 and body and len(body) > 10:
+                    ct = (hdrs or {}).get("content-type", "").lower()
+                    # Critical: skip HTML 200s — SPA apps return 200 for everything
+                    if "text/html" in ct and "<html" in body.lower():
                         continue
-                    s, _, body = await fetch(self.session, "GET", bak_url, self.rl)
-                    if s == 200 and body and len(body) > 10:
-                        self.store.add_endpoint(bak_url, source="Backup_Suffix",
-                                                score=Conf.CONFIRMED)
-                        self.emit.warn(f"[BACKUP-SUFFIX] Exposed: {bak_url}")
-                        Extractor.secrets(body, bak_url, self.store, self.emit)
-                        found += 1
+                    self.store.add_endpoint(bak_url, source="Backup_Suffix",
+                                            score=Conf.CONFIRMED)
+                    self.emit.warn(f"[BACKUP-SUFFIX] Exposed: {bak_url}")
+                    Extractor.secrets(body, bak_url, self.store, self.emit)
+                    found += 1
         if found:
             self.emit.always_success(f"[Backup] {found} exposed files found")
+        else:
+            self.emit.always_info("[Backup] No exposed backup files found")
 
 def classify_admin_endpoints(store: Store):
     for ep in store.endpoints.values():
@@ -1954,6 +2002,14 @@ class Spider:
         xpb = (headers.get("X-Powered-By","") or headers.get("x-powered-by","")).lower()
         ct  = (headers.get("Content-Type","") or headers.get("content-type","")).lower()
         body_lo = body.lower()
+
+        # ── Leakage: Expose highly verbose Server headers ───────────────
+        raw_srv = headers.get("Server") or headers.get("server", "")
+        raw_xpb = headers.get("X-Powered-By") or headers.get("x-powered-by", "")
+        raw_asp = headers.get("X-AspNet-Version") or headers.get("x-aspnet-version", "")
+        if raw_srv: tech.add(f"Server: {raw_srv}")
+        if raw_xpb: tech.add(f"X-Powered-By: {raw_xpb}")
+        if raw_asp: tech.add(f"X-AspNet-Version: {raw_asp}")
 
         # ── Server / infrastructure ──────────────────────────────────────
         if "nginx"        in srv:                               tech.add("Nginx")
@@ -2163,6 +2219,7 @@ class Spider:
                 Extractor.js_endpoints(tag.string, url, self.store, self.emit)
                 Extractor.js_params(tag.string, url, self.store, self.emit)
                 Extractor.secrets(tag.string, url, self.store, self.emit)
+                Extractor.exposed_files(tag.string, url, self.store, self.emit)
         for form in soup.find_all("form"):
             action = form.get("action") or url
             full   = urljoin(url, action)
@@ -2208,6 +2265,7 @@ class Spider:
         Extractor.secrets(text, url, self.store, self.emit)
         Extractor.js_endpoints(text, url, self.store, self.emit)
         Extractor.js_params(text, url, self.store, self.emit)
+        Extractor.exposed_files(text, url, self.store, self.emit)
         await self._check_sourcemap(session, url)
         for m in re.finditer(r'import\s*\(\s*["\']([^"\']+)["\']', text):
             full = urljoin(url, m.group(1))
@@ -2241,6 +2299,19 @@ class Spider:
                                 self.store.add_endpoint(url, source=source,
                                                         score=Conf.MEDIUM, auth_required=True)
                                 self.emit.warn(f"[Auth-wall:{s}] {url}")
+                            elif s in (500, 501, 502, 503) and body:
+                                # Error Leak: verbose stack traces or DB errors
+                                _ERR_RE = re.compile(
+                                    r'(?:Traceback|Exception in thread|SyntaxError|ParseError|'
+                                    r'SQLSTATE|You have an error in your SQL|ORA-\d{5}|'
+                                    r'Fatal error:|Warning:|Uncaught \w+Error|'
+                                    r'at [a-zA-Z\.]+\([a-zA-Z]+\.java:\d+\))',
+                                    re.I
+                                )
+                                if _ERR_RE.search(body):
+                                    self.store.add_endpoint(url, source="Error_Leak", score=Conf.HIGH)
+                                    self.store.add_secret(body[:200], "Error_Stack_Trace", url)
+                                    self.emit.warn(f"[Error-Leak] Verbose error at {url}")
                             elif s == 200:
                                 if depth <= 1:
                                     self._detect_tech(hdrs, body, url)
@@ -2255,6 +2326,18 @@ class Spider:
                                     await self._process_js(url, body, session)
                                 elif "json" in ct:
                                     self.store.add_endpoint(url, source="JSON_Response", score=Conf.MEDIUM)
+                                    # -- Geo-location leak check
+                                    _GEO_RE = re.compile(
+                                        r'(?:"latitude"|"lat"|"lng"|"longitude"|"geo"|"coordinates")'
+                                        r'\s*:\s*(-?\d{1,3}\.\d+)',
+                                        re.I
+                                    )
+                                    for _gm in _GEO_RE.finditer(body):
+                                        self.store.add_secret(
+                                            f"GeoCoord: {_gm.group(0)[:60]}",
+                                            "GeoLocation_Leak", url)
+                                        self.emit.warn(f"[Geo-Leak] Coordinates exposed in response: {url}")
+                                        break  # One warning per endpoint is enough
                                     # ── path strings in JSON values ────────────────
                                     for m in re.finditer(r'"([/][a-zA-Z0-9_\-\/]+)"', body):
                                         path = m.group(1)
