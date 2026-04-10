@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-  HELLHOUND SPIDER  v11.1  —  Standalone Recon Engine
+  HELLHOUND SPIDER  v12.0  —  Standalone Recon Engine
+
   Full SPA + Non-SPA Crawler | robots.txt | sitemap.xml | JS Analysis
 
 Dependencies:
@@ -37,10 +38,14 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
 # ══════════════════════════════════════════════════════════════════════
-# VERSION
+# METADATA
 # ══════════════════════════════════════════════════════════════════════
 
-VERSION = "12.0"
+VERSION      = "12.0"
+__author__   = "Sree Danush S (L4ZZ3RJ0D)"
+__license__  = "MIT"
+__credits__  = ["L4ZZ3RJ0D"]
+__maintainer__ = "L4ZZ3RJ0D"
 
 # ══════════════════════════════════════════════════════════════════════
 # TERMINAL COLOURS
@@ -117,6 +122,8 @@ _BANNER_ART = r"""
               ██║  ██║███████╗███████╗███████╗██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
               ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝"""
 
+_BANNER_CREDIT = "[ Created by L4ZZ3RJ0D — @l4zz3rj0d ]"
+
 _BANNER_SUB = (
     "  ╔──────────────────────────────────────────────────────────────────────╗\n"
     "  │  SPIDER v{ver}  ·  SPA + Non-SPA  ·  robots.txt  ·  sitemap  ·  JS   │\n"
@@ -125,9 +132,11 @@ _BANNER_SUB = (
 
 def print_banner():
     if _no_color():
-        print(f"  HELLHOUND SPIDER v{VERSION}  —  Recon Engine\n")
+        print(f"  HELLHOUND SPIDER v{VERSION}  —  Recon Engine")
+        print(f"  {_BANNER_CREDIT}\n")
         return
     print(f"{C.R}{C.B}{_BANNER_ART}{C.RST}")
+    print(f"{C.W}{_BANNER_CREDIT.center(84)}{C.RST}")
     print(f"{C.RD}{_BANNER_SUB.format(ver=VERSION)}{C.RST}\n")
 
 # ══════════════════════════════════════════════════════════════════════
