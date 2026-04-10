@@ -122,21 +122,21 @@ _BANNER_ART = r"""
               ██║  ██║███████╗███████╗███████╗██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
               ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝"""
 
-_BANNER_CREDIT = "[ Created by L4ZZ3RJ0D — @l4zz3rj0d ]"
+_BANNER_CREDIT = "                         [ Created by L4ZZ3RJ0D — @l4zz3rj0d ]"
 
 _BANNER_SUB = (
-    "  ╔──────────────────────────────────────────────────────────────────────╗\n"
-    "  │  SPIDER v{ver}  ·  SPA + Non-SPA  ·  robots.txt  ·  sitemap  ·  JS   │\n"
-    "  ╚──────────────────────────────────────────────────────────────────────╝"
+    "           ╔──────────────────────────────────────────────────────────────────────╗\n"
+    "           │  SPIDER v{ver}  ·  SPA + Non-SPA  ·  robots.txt  ·  sitemap  ·  JS    │\n"
+    "           ╚──────────────────────────────────────────────────────────────────────╝"
 )
 
 def print_banner():
     if _no_color():
         print(f"  HELLHOUND SPIDER v{VERSION}  —  Recon Engine")
-        print(f"  {_BANNER_CREDIT}\n")
+        print(f"  {_BANNER_CREDIT.strip()}\n")
         return
     print(f"{C.R}{C.B}{_BANNER_ART}{C.RST}")
-    print(f"{C.W}{_BANNER_CREDIT.center(84)}{C.RST}")
+    print(f"{C.W}{_BANNER_CREDIT}{C.RST}")
     print(f"{C.RD}{_BANNER_SUB.format(ver=VERSION)}{C.RST}\n")
 
 # ══════════════════════════════════════════════════════════════════════
