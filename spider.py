@@ -2778,7 +2778,7 @@ def _build_parser() -> argparse.ArgumentParser:
     util.add_argument("--diff",    type=str, default=None, metavar="OLD_REPORT",
                       help="Diff this scan against an old JSON report")
     util.add_argument("--upgrade", action="store_true",
-                      help="Upgrade Hellhound-Spider to the latest version via update.sh")
+                      help="Upgrade Hellhound-Spider to the latest version")
 
     return p
 

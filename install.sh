@@ -16,7 +16,57 @@ BLD='\033[1m'
 info()    { echo -e "${CYN}[*]${RST} $1"; }
 success() { echo -e "${GRN}${BLD}[✓]${RST} $1"; }
 warn()    { echo -e "${YLW}[!]${RST} $1"; }
-error()   { echo -e "${RED}[✗]${RST} $1"; exit 1; }
+error()   { echo -e "${RED}[✗]${RST} $1"; stop_animation; exit 1; }
+
+# ── Animator Logic (Cinematic) ────────────────────────────────────────────────
+ANIM_PID=0
+
+start_animation() {
+    local label="$1"
+    # Ensure any previous animation is stopped
+    stop_animation
+    
+    python3 -c "
+import math, time, sys
+label = \"$label\"
+def wave(label, t):
+    res = ''
+    for i, c in enumerate(label):
+        if not c.isalpha(): res += c; continue
+        v = math.sin(t * 10 + i * 0.4)
+        if v > 0: res += f'\033[91m\033[1m{c.upper()}\033[0m'
+        else: res += f'\033[31m{c.lower()}\033[0m'
+    return res
+def braille(t):
+    chars = '⡀⡄⡆⡇⣇⣧⣷⣿'
+    bar = ''
+    for i in range(15):
+        idx = int((math.sin(t * 5 + i * 0.3) + 1) / 2 * (len(chars) - 1))
+        bar += f'\033[91m{chars[idx]}\033[0m'
+    return bar
+start = time.time()
+try:
+    while True:
+        t = time.time() - start
+        sys.stdout.write(f'\r  \033[96m[*]\033[0m {wave(label, t)}  {braille(t)}')
+        sys.stdout.flush()
+        time.sleep(0.06)
+except KeyboardInterrupt:
+    pass
+" &
+    ANIM_PID=$!
+}
+
+stop_animation() {
+    if [ "$ANIM_PID" -ne 0 ]; then
+        kill "$ANIM_PID" &>/dev/null || true
+        wait "$ANIM_PID" 2>/dev/null || true
+        printf "\r\b\b\033[K" # Move back and clear the entire line
+        ANIM_PID=0
+    fi
+}
+
+trap "stop_animation" EXIT INT TERM
 
 # Parse flags
 NON_INTERACTIVE=false
@@ -26,20 +76,12 @@ for arg in "$@"; do
     fi
 done
 
-echo -e "${RED}${BLD}"
-cat << 'BANNER'
-              ██╗  ██╗███████╗██╗     ██╗     ██╗  ██╗ ██████╗ ██╗   ██╗███╗   ██╗██████╗
-              ██║  ██║██╔════╝██║     ██║     ██║  ██║██╔═══██╗██║   ██║████╗  ██║██╔══██╗
-              ███████║█████╗  ██║     ██║     ███████║██║   ██║██║   ██║██╔██╗ ██║██║  ██║
-              ██╔══██║██╔══╝  ██║     ██║     ██╔══██║██║   ██║██║   ██║██║╚██╗██║██║  ██║
-              ██║  ██║███████╗███████╗███████╗██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
-              ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝
-BANNER
-echo -e "${RST}"
-echo -e "  ${CYN}Hellhound Spider v12.0${RST}  —  Installer\n"
-
 # ── Check Python version ───────────────────────────────────────────────────────
-info "Checking Python version..."
+start_animation "PREPARING HELLHOUND"
+if ! command -v python3 &>/dev/null; then
+    stop_animation
+    error "Python 3 not found. Install Python 3.10+ and try again."
+fi
 if ! command -v python3 &>/dev/null; then
     error "Python 3 not found. Install Python 3.10+ and try again."
 fi
@@ -54,7 +96,7 @@ fi
 success "Python $PY_VERSION found"
 
 # ── Virtual Environment Setup ────────────────────────────────────────────────
-info "Setting up virtual environment..."
+start_animation "ISOLATING CORE"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 
@@ -65,9 +107,10 @@ VENV_PYTHON="$VENV_DIR/bin/python3"
 success "Virtual environment ready: $VENV_DIR"
 
 # ── Install pip dependencies ───────────────────────────────────────────────────
-info "Installing dependencies from requirements.txt into venv..."
+start_animation "DECRYPTING DEPENDENCIES"
 "$VENV_PYTHON" -m pip install --quiet --upgrade pip
 "$VENV_PYTHON" -m pip install --quiet -r requirements.txt
+stop_animation
 success "Core dependencies installed"
 
 # ── Optional: Playwright ───────────────────────────────────────────────────────
@@ -89,24 +132,25 @@ else
 fi
 
 if [[ "$INSTALL_PLAYWRIGHT" =~ ^[Yy]$ ]]; then
-    info "Installing Playwright package..."
+    start_animation "MOUNTING SPA ENGINE"
     "$VENV_PYTHON" -m pip install --quiet --upgrade playwright
     
-    info "Installing Chromium browser binaries..."
+    start_animation "FETCHING CHROMIUM"
     "$VENV_PYTHON" -m playwright install chromium
     
-    info "Installing system dependencies (may require sudo)..."
+    start_animation "HARDENING SYSTEM"
     if command -v sudo &>/dev/null && [ "$EUID" -ne 0 ]; then
         sudo "$VENV_PYTHON" -m playwright install-deps chromium || warn "System dependency installation failed. You might need to install them manually."
     else
         "$VENV_PYTHON" -m playwright install-deps chromium || warn "System dependency installation failed. You might need to install them manually."
     fi
     
+    stop_animation
     success "Playwright + Chromium + Dependencies installed"
 fi
 
 # ── Install the spider command ─────────────────────────────────────────────────
-info "Installing spider command binary..."
+start_animation "FINALIZING DEPLOYMENT"
 
 SPIDER_SRC="$SCRIPT_DIR/spider.py"
 if [ ! -f "$SPIDER_SRC" ]; then
@@ -144,7 +188,7 @@ else
     chmod +x "$INSTALL_PATH"
 fi
 rm -f "$WRAPPER_TMP"
-
+stop_animation
 success "Installed to $INSTALL_PATH"
 
 # ── PATH check for ~/.local/bin ────────────────────────────────────────────────
