@@ -2735,7 +2735,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    p.add_argument("target", help="Target URL  (e.g. https://example.com)")
+    p.add_argument("target", nargs="?", help="Target URL  (e.g. https://example.com)")
 
     scan = p.add_argument_group(f"{C.CY}Scan Options{C.RST}")
     scan.add_argument("--depth",   "-d",  type=int, default=4,  metavar="N",
@@ -2777,6 +2777,8 @@ def _build_parser() -> argparse.ArgumentParser:
     util = p.add_argument_group(f"{C.CY}Utilities{C.RST}")
     util.add_argument("--diff",    type=str, default=None, metavar="OLD_REPORT",
                       help="Diff this scan against an old JSON report")
+    util.add_argument("--upgrade", action="store_true",
+                      help="Upgrade Hellhound-Spider to the latest version via update.sh")
 
     return p
 
@@ -2787,6 +2789,18 @@ def main():
 
     emit = Emit(verbose=args.verbose)
     print_banner()
+
+    if args.upgrade:
+        emit.always_info("Initiating system upgrade...")
+        if os.path.exists("update.sh"):
+            os.system("bash update.sh")
+        else:
+            emit.warn("update.sh not found in the current directory.")
+        sys.exit(0)
+
+    if not args.target:
+        parser.print_help()
+        sys.exit(1)
 
     # Pre-flight info block
     nc = emit._nc
