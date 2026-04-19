@@ -15,6 +15,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -143,6 +144,92 @@ def print_banner():
     print(f"{C.RD}{_BANNER_SUB.format(ver=VERSION)}{C.RST}\n")
 
 # ══════════════════════════════════════════════════════════════════════
+# ANIMATOR
+# ══════════════════════════════════════════════════════════════════════
+
+class CLIAnimator:
+    """
+    Handles Sample T31 (Case-Wave) and Sample P33 (Braille-Wave).
+    Maintains a sticky status line at the bottom of the terminal.
+    """
+    def __init__(self, emit):
+        self.emit = emit
+        self.active = False
+        self.task = None
+        self.label = ""
+        self.total = 0
+        self.current = 0
+        self._nc = emit._nc
+        self._last_line = ""
+
+    def start(self, label, total=0):
+        if self._nc: return
+        self.label = label
+        self.total = total
+        self.current = 0
+        self.active = True
+        if not self.task:
+            self.task = asyncio.create_task(self._animate())
+
+    def stop(self):
+        self.active = False
+        if self.task:
+            self.task.cancel()
+            self.task = None
+        self._clear()
+
+    def update(self, current, label=None):
+        self.current = current
+        if label: self.label = label
+
+    def _clear(self):
+        """Clears the status line so a log can be printed above it."""
+        if not self._nc and self._last_line:
+            # Move cursor to start, overwrite with spaces, return to start
+            sys.stdout.write("\r" + " " * (len(_strip(self._last_line)) + 10) + "\r")
+            sys.stdout.flush()
+
+    async def _animate(self):
+        start_time = time.time()
+        while self.active:
+            try:
+                t = time.time() - start_time
+                
+                # T31: Case-Wave for Label
+                anim_label = ""
+                for i, c in enumerate(self.label):
+                    if not c.isalpha():
+                        anim_label += c
+                        continue
+                    v = math.sin(t * 10 + i * 0.4)
+                    if v > 0:
+                        anim_label += f"{C.R}{C.B}{c.upper()}{C.RST}"
+                    else:
+                        anim_label += f"{C.RD}{c.lower()}{C.RST}"
+
+                # P33: Braille-Wave for Progress
+                bar_w = 20
+                chars = "⡀⡄⡆⡇⣇⣧⣷⣿"
+                bar = ""
+                for i in range(bar_w):
+                    idx = int((math.sin(t * 5 + i * 0.3) + 1) / 2 * (len(chars) - 1))
+                    bar += f"{C.R}{chars[idx]}{C.RST}"
+
+                stats = ""
+                if self.total > 0:
+                    stats = f" {C.W}{self.current}/{self.total}{C.RST}"
+
+                line = f"\r  {C.CY}[*]{C.RST} {anim_label}  {bar}{stats}"
+                self._last_line = line
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                await asyncio.sleep(0.06)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(0.5)
+
+# ══════════════════════════════════════════════════════════════════════
 # EMIT
 # ══════════════════════════════════════════════════════════════════════
 
@@ -158,11 +245,17 @@ class Emit:
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
         self._nc     = _no_color()
+        self.animator = CLIAnimator(self)
 
     # ── raw write ─────────────────────────────────────────────────────
 
     def _w(self, line: str):
-        print(_strip(line) if self._nc else line, flush=True)
+        if self.animator.active:
+            self.animator._clear()
+            print(_strip(line) if self._nc else line, flush=True)
+            # The animator task will redraw the status line in its next loop
+        else:
+            print(_strip(line) if self._nc else line, flush=True)
 
     # ── log helpers ───────────────────────────────────────────────────
 
@@ -1319,8 +1412,10 @@ class IntelligentProber:
         targets = sorted(targets, key=lambda e: e.get("confidence", 0), reverse=True)[:100]
 
         self.emit.always_info(f"[Prober] {len(targets)} endpoints selected for probing")
+        self.emit.animator.start("Intelligent Probing", total=len(targets))
         n_sens = n_meth = 0
-        for ep in targets:
+        for i, ep in enumerate(targets):
+            self.emit.animator.update(i+1)
             url = ep["url"]; method = ep["methods"][0]
             s, hdrs, body = await fetch(self.session, method, url, self.rl)
             if s is None: continue
@@ -1350,6 +1445,7 @@ class IntelligentProber:
                         self.emit.info(f"[MethodOracle] Params discovered: {oracle_params} ← {url}")
             if self.cfg.enable_cors:
                 await self._cors(url)
+        self.emit.animator.stop()
         self.emit.always_success(f"Probing done — sensitive: {n_sens}, new methods: {n_meth}")
 
     async def _methods(self, url, base_hdrs):
@@ -1874,8 +1970,10 @@ class BackupProber:
 
     async def run(self):
         self.emit.always_info("[Backup] Probing for exposed backup/config files…")
+        self.emit.animator.start("Backup Audit", total=len(_BACKUP_PATHS))
         found = 0
-        for path in _BACKUP_PATHS:
+        for i, path in enumerate(_BACKUP_PATHS):
+            self.emit.animator.update(i+1)
             url = urljoin(self.target, path)
             s, hdrs, body = await fetch(self.session, "GET", url, self.rl)
             if s == 200 and body and len(body) > 10:
@@ -1920,6 +2018,7 @@ class BackupProber:
                     self.emit.warn(f"[BACKUP-SUFFIX] Exposed: {bak_url}")
                     Extractor.secrets(body, bak_url, self.store, self.emit)
                     found += 1
+        self.emit.animator.stop()
         if found:
             self.emit.always_success(f"[Backup] {found} exposed files found")
         else:
@@ -2480,10 +2579,27 @@ class Spider:
                 f"concurrency={self.cfg.concurrency}, "
                 f"auth={'yes' if self.cookies or self.extra_headers else 'no'}, "
                 f"seed={self.queue.qsize()} URLs")
+            
+            # P33: Sticky footer status during crawl
+            self.emit.animator.start("Crawling Target")
+            
             workers = [asyncio.create_task(self._worker(session, i, crawl_delay))
                        for i in range(self.cfg.concurrency)]
+            
+            # Dynamic update task for crawl progress
+            async def _update_crawl_status():
+                while self.emit.animator.active:
+                    self.emit.animator.update(len(self.visited), f"Crawling: {len(self.visited)} URLs")
+                    await asyncio.sleep(1.0)
+            
+            status_task = asyncio.create_task(_update_crawl_status())
+            
             await self.queue.join()
+            
             for w in workers: w.cancel()
+            status_task.cancel()
+            self.emit.animator.stop()
+            
             await asyncio.gather(*workers, return_exceptions=True)
             if self.cfg.enable_probing:
                 prober = IntelligentProber(session, self.store, self.emit, self.rl, self.cfg)
@@ -2583,6 +2699,16 @@ def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_chec
         def print_always(self, m):    print(m)
         @property
         def _nc(self): return True
+        # Animation stubs for framework usage
+        @property
+        def animator(self):
+            class _S:
+                active = False
+                def start(self, *a, **k): pass
+                def stop(self, *a, **k): pass
+                def update(self, *a, **k): pass
+                def _clear(self): pass
+            return _S()
 
     emit = _W(emit_obj, cfg.verbose)
     return _do_run(target, cfg, emit, cookies, xhdrs)
