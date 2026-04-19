@@ -37,8 +37,29 @@ fi
 
 # ── Pull latest changes ───────────────────────────────────────────────────────
 info "Fetching latest changes from repository..."
-git pull origin main || warn "Could not pull from 'main' branch. Trying default..." && git pull
-success "Source code updated"
+
+# Check for local changes and stash them to avoid pull conflicts
+LOCAL_CHANGES=$(git status --porcelain)
+if [ -n "$LOCAL_CHANGES" ]; then
+    warn "Local changes detected — stashing to ensure a clean update..."
+    git stash
+fi
+
+# Determine current branch and pull
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+if git pull origin "$CURRENT_BRANCH"; then
+    success "Source code updated [branch: $CURRENT_BRANCH]"
+else
+    warn "Standard pull failed — attempting emergency fetch/reset..."
+    git fetch --all
+    git pull || warn "Could not pull latest changes. You may have uncommitted conflicts."
+fi
+
+# Restore local changes if they were stashed
+if [ -n "$LOCAL_CHANGES" ]; then
+    info "Restoring your local changes..."
+    git stash pop &>/dev/null || warn "Could not auto-apply local changes. Use 'git stash pop' manually."
+fi
 
 # ── Run installer in non-interactive mode ─────────────────────────────────────
 info "Refreshing installation..."
