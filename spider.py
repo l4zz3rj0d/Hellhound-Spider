@@ -34,8 +34,13 @@ from bs4 import BeautifulSoup, Comment
 try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = True
-except ImportError:
+    PLAYWRIGHT_ERROR     = None
+except ImportError as e:
     PLAYWRIGHT_AVAILABLE = False
+    PLAYWRIGHT_ERROR     = str(e)
+except Exception as e:
+    PLAYWRIGHT_AVAILABLE = False
+    PLAYWRIGHT_ERROR     = f"{type(e).__name__}: {e}"
 
 # ══════════════════════════════════════════════════════════════════════
 # METADATA
@@ -2719,8 +2724,11 @@ def main():
     _pf("Depth",       str(args.depth))
     _pf("Concurrency", str(args.concurrency))
     _pf("Timeout",     f"{args.timeout}s")
-    _pf("Playwright",
-        "enabled" if (not args.no_playwright and PLAYWRIGHT_AVAILABLE) else "disabled",
+    pw_status = "enabled" if (not args.no_playwright and PLAYWRIGHT_AVAILABLE) else "disabled"
+    if pw_status == "disabled" and PLAYWRIGHT_ERROR and args.verbose:
+        pw_status += f"  {C.R}({PLAYWRIGHT_ERROR}){C.RST}"
+    
+    _pf("Playwright", pw_status,
         C.G if (not args.no_playwright and PLAYWRIGHT_AVAILABLE) else C.GR)
     _pf("Verbose",
         "on" if args.verbose else "off",

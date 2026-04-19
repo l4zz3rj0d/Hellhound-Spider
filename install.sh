@@ -89,10 +89,20 @@ else
 fi
 
 if [[ "$INSTALL_PLAYWRIGHT" =~ ^[Yy]$ ]]; then
-    info "Installing Playwright into venv..."
-    "$VENV_PYTHON" -m pip install --quiet playwright
+    info "Installing Playwright package..."
+    "$VENV_PYTHON" -m pip install --quiet --upgrade playwright
+    
+    info "Installing Chromium browser binaries..."
     "$VENV_PYTHON" -m playwright install chromium
-    success "Playwright + Chromium installed"
+    
+    info "Installing system dependencies (may require sudo)..."
+    if command -v sudo &>/dev/null && [ "$EUID" -ne 0 ]; then
+        sudo "$VENV_PYTHON" -m playwright install-deps chromium || warn "System dependency installation failed. You might need to install them manually."
+    else
+        "$VENV_PYTHON" -m playwright install-deps chromium || warn "System dependency installation failed. You might need to install them manually."
+    fi
+    
+    success "Playwright + Chromium + Dependencies installed"
 fi
 
 # ── Install the spider command ─────────────────────────────────────────────────
