@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white"/>
   <img src="https://img.shields.io/badge/version-12.0-red?style=flat-square"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square"/>
-  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square"/>
+  <img src="https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square"/>
 </p>
 
 ---
@@ -203,9 +203,7 @@ Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, P
 
 ---
 
-## Legal
-
-For authorized security testing only. The author is not responsible for misuse.
+For authorized security testing only. This software is licensed under the **GNU General Public License v3 (GPLv3)**.
 
 ---
 

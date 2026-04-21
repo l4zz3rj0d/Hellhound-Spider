@@ -49,7 +49,7 @@ except Exception as e:
 
 VERSION      = "12.0"
 __author__   = "Sree Danush S (L4ZZ3RJ0D)"
-__license__  = "MIT"
+__license__  = "GPLv3"
 __credits__  = ["L4ZZ3RJ0D"]
 __maintainer__ = "L4ZZ3RJ0D"
 
@@ -214,19 +214,17 @@ class CLIAnimator:
                     else:
                         anim_label += f"{C.RD}{c.lower()}{C.RST}"
 
-                # P33: Braille-Wave for Progress
-                bar_w = 20
+                # P33: Braille-Wave for Progress (15 character bar per spec)
+                bar_w = 15
                 chars = "⡀⡄⡆⡇⣇⣧⣷⣿"
                 bar = ""
                 for i in range(bar_w):
                     idx = int((math.sin(t * 5 + i * 0.3) + 1) / 2 * (len(chars) - 1))
                     bar += f"{C.R}{chars[idx]}{C.RST}"
 
-                stats = ""
-                if self.total > 0:
-                    stats = f" {C.W}{self.current}/{self.total}{C.RST}"
-
-                line = f"\r  {C.CY}[*]{C.RST} {anim_label}  {bar}{stats}"
+                stats = f"{C.W}{self.current}/{self.total}{C.RST}"
+                # Format: [*] <Case-Wave Label>  <Braille-Wave Bar> <Current/Total Stats>
+                line = f"\r {C.CY}[*]{C.RST} {anim_label}  {bar} {stats}"
                 self._last_line = line
                 sys.stdout.write(line)
                 sys.stdout.flush()
