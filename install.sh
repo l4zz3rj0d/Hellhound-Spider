@@ -23,9 +23,9 @@ ANIM_PID=0
 
 start_animation() {
     local label="$1"
-    # Ensure any previous animation is stopped
     stop_animation
     
+    # Ultra-Wide Animator matching spider.py v12.0 spec
     python3 -c "
 import math, time, sys
 label = \"$label\"
@@ -40,15 +40,16 @@ def wave(label, t):
 def braille(t):
     chars = '⡀⡄⡆⡇⣇⣧⣷⣿'
     bar = ''
-    for i in range(15):
-        idx = int((math.sin(t * 5 + i * 0.3) + 1) / 2 * (len(chars) - 1))
+    for i in range(50):
+        idx = int((math.sin(t * 5 + i * 0.2) + 1) / 2 * (len(chars) - 1))
         bar += f'\033[91m{chars[idx]}\033[0m'
     return bar
 start = time.time()
 try:
     while True:
         t = time.time() - start
-        sys.stdout.write(f'\r  \033[96m[*]\033[0m {wave(label, t)}  {braille(t)}')
+        # Fixed width padding for labels (25 chars) to prevent jitter
+        sys.stdout.write(f'\r  {wave(label, t):<35}  {braille(t)} ')
         sys.stdout.flush()
         time.sleep(0.06)
 except KeyboardInterrupt:
@@ -82,10 +83,7 @@ if ! command -v python3 &>/dev/null; then
     stop_animation
     error "Python 3 not found. Install Python 3.10+ and try again."
 fi
-if ! command -v python3 &>/dev/null; then
-    error "Python 3 not found. Install Python 3.10+ and try again."
-fi
-
+# ... (removed redundant check)
 PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
 PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
@@ -93,6 +91,7 @@ PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
 if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; }; then
     error "Python 3.10+ required. Found: $PY_VERSION"
 fi
+stop_animation
 success "Python $PY_VERSION found"
 
 # ── Virtual Environment Setup ────────────────────────────────────────────────
@@ -104,6 +103,7 @@ if [ ! -d "$VENV_DIR" ]; then
     python3 -m venv "$VENV_DIR" || error "Failed to create virtual environment. Ensure 'python3-venv' is installed."
 fi
 VENV_PYTHON="$VENV_DIR/bin/python3"
+stop_animation
 success "Virtual environment ready: $VENV_DIR"
 
 # ── Install pip dependencies ───────────────────────────────────────────────────
@@ -132,20 +132,20 @@ else
 fi
 
 if [[ "$INSTALL_PLAYWRIGHT" =~ ^[Yy]$ ]]; then
-    start_animation "MOUNTING SPA ENGINE"
+    stop_animation
+    info "Mounting SPA Engine..."
     "$VENV_PYTHON" -m pip install --quiet --upgrade playwright
     
-    start_animation "FETCHING CHROMIUM"
+    info "Fetching Chromium (this may take a minute)..."
     "$VENV_PYTHON" -m playwright install chromium
     
-    start_animation "HARDENING SYSTEM"
+    info "Hardening system dependencies..."
     if command -v sudo &>/dev/null && [ "$EUID" -ne 0 ]; then
         sudo "$VENV_PYTHON" -m playwright install-deps chromium || warn "System dependency installation failed. You might need to install them manually."
     else
         "$VENV_PYTHON" -m playwright install-deps chromium || warn "System dependency installation failed. You might need to install them manually."
     fi
     
-    stop_animation
     success "Playwright + Chromium + Dependencies installed"
 fi
 

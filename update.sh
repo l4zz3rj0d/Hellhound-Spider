@@ -25,6 +25,7 @@ start_animation() {
     local label="$1"
     stop_animation
     
+    # Ultra-Wide Animator matching spider.py v12.0 spec
     python3 -c "
 import math, time, sys
 label = \"$label\"
@@ -39,15 +40,16 @@ def wave(label, t):
 def braille(t):
     chars = '⡀⡄⡆⡇⣇⣧⣷⣿'
     bar = ''
-    for i in range(15):
-        idx = int((math.sin(t * 5 + i * 0.3) + 1) / 2 * (len(chars) - 1))
+    for i in range(50):
+        idx = int((math.sin(t * 5 + i * 0.2) + 1) / 2 * (len(chars) - 1))
         bar += f'\033[91m{chars[idx]}\033[0m'
     return bar
 start = time.time()
 try:
     while True:
         t = time.time() - start
-        sys.stdout.write(f'\r  \033[96m[*]\033[0m {wave(label, t)}  {braille(t)}')
+        # Fixed width padding for labels (25 chars) to prevent jitter
+        sys.stdout.write(f'\r  {wave(label, t):<35}  {braille(t)} ')
         sys.stdout.flush()
         time.sleep(0.06)
 except KeyboardInterrupt:
@@ -75,19 +77,24 @@ if [ ! -d ".git" ]; then
 fi
 
 # ── Pull latest changes ───────────────────────────────────────────────────────
+stop_animation
 start_animation "FETCHING UPDATES"
 
 # Check for local changes and stash them to avoid pull conflicts
 LOCAL_CHANGES=$(git status --porcelain)
 if [ -n "$LOCAL_CHANGES" ]; then
+    stop_animation
     warn "Local changes detected — stashing to ensure a clean update..."
     git stash
+    start_animation "FETCHING UPDATES"
 fi
 
 # Determine current branch and pull
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+stop_animation
+info "Fetching updates from branch: $CURRENT_BRANCH..."
 if git pull origin "$CURRENT_BRANCH"; then
-    success "Source code updated [branch: $CURRENT_BRANCH]"
+    success "Source code updated"
 else
     warn "Standard pull failed — attempting emergency fetch/reset..."
     git fetch --all
@@ -102,10 +109,10 @@ if [ -n "$LOCAL_CHANGES" ]; then
 fi
 
 # ── Run installer in non-interactive mode ─────────────────────────────────────
-start_animation "SYNCHRONIZING SYSTEM"
+stop_animation
+info "Synchronizing system configuration..."
 chmod +x install.sh
 ./install.sh --yes
-stop_animation
 success "Installation refreshed successfully"
 
 echo ""
