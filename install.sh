@@ -157,13 +157,31 @@ if [ ! -f "$SPIDER_SRC" ]; then
     error "spider.py not found in $SCRIPT_DIR"
 fi
 
-# Create a temporary wrapper script
+# Build a self-locating wrapper so the script works for ANY user, not just
+# the one who ran the installer.  At runtime the wrapper resolves its own real
+# path, derives SCRIPT_DIR from it, then calls the venv python from there.
+# This avoids hard-coding paths that only the installer's $HOME can reach.
 WRAPPER_TMP=$(mktemp)
-cat << EOW > "$WRAPPER_TMP"
+cat <<'EOW' > "$WRAPPER_TMP"
 #!/usr/bin/env bash
-# Hellhound Spider — Wrapper Script
-# Generated on $(date)
-"$VENV_PYTHON" "$SPIDER_SRC" "\$@"
+# Hellhound Spider — Wrapper Script (self-locating, runs without sudo)
+# Resolve the real location of this wrapper even through symlinks.
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+EOW
+# Append the concrete install-time paths as variables into the wrapper
+cat <<EOW >> "$WRAPPER_TMP"
+VENV_PYTHON="$VENV_PYTHON"
+SPIDER_SRC="$SPIDER_SRC"
+EOW
+# Append the execution block (single-quoted heredoc so \$@ isn't expanded now)
+cat <<'EOW' >> "$WRAPPER_TMP"
+if [ ! -x "$VENV_PYTHON" ]; then
+    echo "[!] Hellhound venv not found at: $VENV_PYTHON" >&2
+    echo "    Re-run install.sh to repair the installation." >&2
+    exit 1
+fi
+exec "$VENV_PYTHON" "$SPIDER_SRC" "$@"
 EOW
 
 # Determine install location — prefer /usr/local/bin, fall back to ~/.local/bin
@@ -179,17 +197,26 @@ fi
 
 INSTALL_PATH="$INSTALL_DIR/spider"
 
-# Copy and make executable
+# Copy and set permissions.
+# Use explicit 755 (not just +x) so a restrictive umask can't leave the file
+# non-executable for other users — that's what causes "Permission denied".
 if [ "${USE_SUDO:-false}" = true ]; then
     sudo cp "$WRAPPER_TMP" "$INSTALL_PATH"
-    sudo chmod +x "$INSTALL_PATH"
+    sudo chmod 755 "$INSTALL_PATH"
 else
     cp "$WRAPPER_TMP" "$INSTALL_PATH"
-    chmod +x "$INSTALL_PATH"
+    chmod 755 "$INSTALL_PATH"
 fi
 rm -f "$WRAPPER_TMP"
 stop_animation
 success "Installed to $INSTALL_PATH"
+
+# Sanity check: verify the installed file is actually world-executable.
+# If not (e.g. ACL override or unusual filesystem), warn immediately.
+if [ ! -x "$INSTALL_PATH" ]; then
+    warn "WARNING: $INSTALL_PATH exists but is not executable by the current user."
+    warn "Try:  sudo chmod 755 $INSTALL_PATH"
+fi
 
 # ── PATH check for ~/.local/bin ────────────────────────────────────────────────
 if [ "$INSTALL_DIR" = "$HOME/.local/bin" ]; then

@@ -1089,8 +1089,12 @@ class Extractor:
         (r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----',                      "Private_Key_PEM"),
         (r'["\'](?:password|passwd|secret|api_?key|token)\s*["\']?\s*[:=]\s*["\']([^"\']{6,})["\']',
                                                                            "Hardcoded_Credential"),
-        (r'["\']([0-9a-fA-F]{32})["\']',                                  "Possible_MD5"),
     ]
+    # Placeholder values that appear in docs/templates — not real secrets
+    _SECRET_PLACEHOLDERS = frozenset({
+        "changeme", "replace", "your_", "yourapikey", "insert", "placeholder",
+        "example", "dummy", "test", "xxxx", "fill_in", "<your", "todo",
+    })
     # Pattern 1: quoted path containing API-style keywords
     # Pattern 2+3: fetch/axios/.method calls — capture FULL URL including ?qs (note: no ? in exclusion set)
     # Pattern 4: template literal base path
@@ -1170,13 +1174,24 @@ class Extractor:
                 if stype not in ("Bitcoin_Address","Ethereum_Address","Private_Key_PEM",
                                   "Hardcoded_Credential","GitHub_PAT") and len(val) < 20:
                     continue
+                # Skip placeholder / documentation values
+                val_lo = val.lower()
+                if any(ph in val_lo for ph in cls._SECRET_PLACEHOLDERS):
+                    continue
                 if store.add_secret(val, stype, url):
                     emit.warn(f"[SECRET:{stype}] {val[:80]}")
 
+    # Safe URL prefixes that every site legitimately serves — not interesting files
+    _EXPOSED_SAFE_PREFIXES = (
+        "/robots", "/sitemap", "/manifest", "/favicon", "/.well-known/",
+    )
+
     @classmethod
     def exposed_files(cls, text, base_url, store, emit):
-        # Passive discovery of common backend/backup/config extensions
-        _EXPOSED_RE = r'(?:https?://|//|/)[a-zA-Z0-9_\-\.\/]*\.(?:log|bak|sql|old|txt|zip|tar\.gz|env|json|xml|yml|yaml|ini|conf)\b'
+        # Passive discovery of HIGH-SIGNAL backup/leak extensions only.
+        # Deliberately excludes .json, .xml, .yml, .yaml, .txt, .ini, .conf —
+        # those fire on /robots.txt, /manifest.json, /openapi.json etc. (noise).
+        _EXPOSED_RE = r'(?:https?://|//|/)[a-zA-Z0-9_\-\.\/]*\.(?:log|bak|sql|old|zip|tar\.gz|env|swp|dump)\b'
         _seen = set()
         for m in re.finditer(_EXPOSED_RE, text, re.I):
             raw = m.group(0)
@@ -1185,6 +1200,10 @@ class Extractor:
             if raw.startswith("//"): full = "http:" + raw
             elif raw.startswith("/"): full = urljoin(base_url, raw)
             else: full = raw
+            # Skip known-safe path prefixes that every site legitimately exposes
+            path = urlparse(full).path.lower()
+            if any(path.startswith(pfx) for pfx in cls._EXPOSED_SAFE_PREFIXES):
+                continue
             store.add_endpoint(full, source="Leaked_File", score=Conf.MEDIUM)
             emit.info(f"[Leaked-File] {full}")
 
@@ -1217,9 +1236,11 @@ class Extractor:
 
     @classmethod
     def html_comments(cls, soup, url, store, emit):
+        # Deliberately excludes 'test' and 'api' — both are too common in build-tool
+        # comments (e.g. "<!-- api handler -->", "<!-- for testing -->") to be signal.
         kw = {"todo","fixme","bug","admin","hidden","secret","debug","config",
-              "key","password","cred","token","hack","temp","test","internal",
-              "private","disabled","api","endpoint"}
+              "key","password","cred","token","hack","temp","internal",
+              "private","disabled","endpoint"}
         for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
             txt = c.strip()
             if len(txt) < 4:
@@ -1386,12 +1407,16 @@ class IntelligentProber:
                     self.emit.info(f"[Methods] {url} → {', '.join(found)}")
                     n_meth += 1
 
-                # BUG-4 Upgrade: Method Oracle – parse error bodies for parameter names
-                oracle_params = await self._method_oracle_params(url)
-                if oracle_params:
-                    changed = self.store.add_runtime_params(url, method, oracle_params)
-                    if changed:
-                        self.emit.info(f"[MethodOracle] Params discovered: {oracle_params} ← {url}")
+                # Method Oracle — only enrich endpoints that already have at least
+                # one known param (from form/js/openapi/query/SPA buckets).
+                # Running oracle on zero-param endpoints hallucinate param names
+                # from generic error pages ("field is required", "invalid input").
+                if _has_params(ep):
+                    oracle_params = await self._method_oracle_params(url)
+                    if oracle_params:
+                        changed = self.store.add_runtime_params(url, method, oracle_params)
+                        if changed:
+                            self.emit.info(f"[MethodOracle] Params discovered: {oracle_params} ← {url}")
             if self.cfg.enable_cors:
                 await self._cors(url)
         self.emit.animator.stop()
@@ -1418,7 +1443,23 @@ class IntelligentProber:
         acao = hdrs.get("Access-Control-Allow-Origin","") or hdrs.get("access-control-allow-origin","")
         acac = (hdrs.get("Access-Control-Allow-Credentials","") or
                 hdrs.get("access-control-allow-credentials","")).lower() == "true"
-        if acao and (acao == "*" or acao == evil):
+        if not acao:
+            return
+        # Blanket wildcard with no credentials = low-signal global policy.
+        # Only report it once per domain (stored on the prober instance) to avoid
+        # flooding 70+ identical MEDIUM findings on apps like Juice Shop.
+        if acao == "*" and not acac:
+            domain = urlparse(url).netloc
+            if not hasattr(self, "_cors_wildcard_domains"):
+                self._cors_wildcard_domains = set()
+            if domain in self._cors_wildcard_domains:
+                return  # already reported for this domain
+            self._cors_wildcard_domains.add(domain)
+            self.store.add_cors(url, evil, acao, acac)
+            self.emit.warn(f"[CORS:MEDIUM] {domain} — blanket wildcard origin policy (first endpoint: {url})")
+            return
+        # Origin-reflected or wildcard-with-credentials → report every endpoint (genuine risk)
+        if acao == evil or acac:
             sev = "HIGH" if acac else "MEDIUM"
             self.store.add_cors(url, evil, acao, acac)
             self.emit.warn(f"[CORS:{sev}] {url} — origin reflected, creds={acac}")
@@ -1504,10 +1545,18 @@ class IntelligentProber:
             r"""(?:field|param|parameter|argument)[:\s]+["']?([a-zA-Z_][a-zA-Z0-9_]{2,40})["']?""",
             r"""(?:provide|supply|include|send)\s+(?:a\s+)?["']?([a-zA-Z_][a-zA-Z0-9_]{2,40})["']?""",
         ]
+        # Common English words that appear as the *next token* after
+        # "provide/send/include" in plain-text error messages but are NOT param names.
+        _ORACLE_STOPWORDS = frozenset({
+            "valid", "invalid", "proper", "correct", "non", "empty", "full",
+            "request", "response", "body", "json", "data", "value", "values",
+            "your", "the", "this", "that", "all", "any", "each", "both",
+            "additional", "required", "missing", "correct", "appropriate",
+        })
         for pat in text_patterns:
             for m in re.finditer(pat, body, re.I):
                 n = m.group(1).strip()
-                if n and len(n) <= 60:
+                if n and len(n) <= 60 and n.lower() not in _ORACLE_STOPWORDS:
                     found.append(n)
 
         return found
@@ -1887,12 +1936,18 @@ _AUTH_PATTERNS = {
 }
 
 _NUMERIC_ID_RE = re.compile(r'(?:^|[_\-/])(?:id|uid|user_id|order_id|item_id|record_id|object_id)$', re.I)
-_PATH_ID_RE    = re.compile(r'/\d{1,12}(?:/|$)')
+# Require ≥3 consecutive digits to avoid matching /v1/, /v2/, /page/1, /404
+# The segment must be at least 3 digits (real DB ids almost always are)
+_PATH_ID_RE    = re.compile(r'/\d{3,12}(?:/|$)')
 _UUID_PATH_RE  = re.compile(r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
 
-_SQLI_PARAM_RE  = re.compile(r'^(?:id|uid|search|q|query|filter|order|sort|page|limit|'
-                               r'category|type|name|user|username|email|product|item|'
-                               r'start|end|from|to|where|group|having)$', re.I)
+# Genuine SQLi-signal params — high-risk identifiers and query-control params.
+# Deliberately excludes pagination (page, limit, from, to, start, end),
+# standard contact fields (name, email, username), and catalog filters
+# (type, category, item, product) — those fire on ~90% of REST endpoints.
+_SQLI_PARAM_RE  = re.compile(
+    r'^(?:id|uid|search|q|query|filter|order|sort|where|group|having)$', re.I
+)
 _CMDI_PARAM_RE  = re.compile(r'^(?:cmd|command|exec|run|shell|ping|host|ip|addr|address|'
                                r'url|uri|target|dest|src|source|file|path|dir|input|arg)$', re.I)
 
@@ -1917,32 +1972,81 @@ class BackupProber:
         self.emit    = emit
         self.rl      = rl
 
+    # HTML markers that indicate a catch-all SPA 200 response rather than a real file
+    _SPA_BODY_MARKERS = (
+        "<html", "<!doctype", "<head", "<body",
+        "<title", "<meta", "<!-- ", "ng-app",
+        "data-reactroot", "__next_data__",
+    )
+
+    # A file-like path segment has a dot OR ends with a backend extension
+    _FILE_LIKE_RE = re.compile(
+        r'(?:\.(?:php|asp|aspx|jsp|py|rb|do|cfm|cgi|pl|lua|go)$|\.[^/]{1,10}$)',
+        re.I
+    )
+
+    def _is_real_file_response(self, ct: str, body: str, canary_hash: str) -> bool:
+        """Return True only if the response looks like a genuine file (not an SPA catch-all)."""
+        # 1. Content-Type must not be text/html
+        if "text/html" in ct:
+            return False
+        # 2. Body must not contain HTML skeleton markers (case-insensitive scan)
+        body_lo = body.lower()
+        if any(marker in body_lo for marker in self._SPA_BODY_MARKERS):
+            return False
+        # 3. Body must be more than 50 bytes
+        if len(body) <= 50:
+            return False
+        # 4. Body must differ from the canary 404 baseline
+        body_hash = hashlib.md5(body.encode(errors="ignore")).hexdigest()
+        if body_hash == canary_hash:
+            return False
+        return True
+
+    async def _fetch_canary_hash(self) -> str:
+        """Fetch a guaranteed-nonexistent URL and return the MD5 of its body.
+        Used to detect SPA catch-all 200 responses during suffix sweep."""
+        canary_url = self.target.rstrip("/") + "/hhscan_canary_404_abc123xyz"
+        _, _, body = await fetch(self.session, "GET", canary_url, self.rl)
+        if body:
+            return hashlib.md5(body.encode(errors="ignore")).hexdigest()
+        return ""
+
     async def run(self):
         self.emit.always_info("[Backup] Probing for exposed backup/config files…")
         self.emit.animator.start("Backup Audit", total=len(_BACKUP_PATHS))
         found = 0
+
+        # Fetch canary baseline ONCE — used by both path list probe AND suffix sweep
+        canary_hash = await self._fetch_canary_hash()
+
         for i, path in enumerate(_BACKUP_PATHS):
             self.emit.animator.update(i+1)
             url = urljoin(self.target, path)
             s, hdrs, body = await fetch(self.session, "GET", url, self.rl)
-            if s == 200 and body and len(body) > 10:
+            if s == 200 and body:
                 ct = (hdrs or {}).get("content-type", "").lower()
-                # Avoid false positives from HTML error pages returned as 200
-                if "text/html" in ct and "<html" in body.lower():
+                # Apply the same strict SPA-safe gate used by suffix sweep
+                if not self._is_real_file_response(ct, body, canary_hash):
                     continue
                 self.store.add_endpoint(url, source="Backup_Probe", score=Conf.CONFIRMED)
                 self.emit.warn(f"[BACKUP] Exposed: {url}  ({len(body)} bytes)")
                 Extractor.secrets(body, url, self.store, self.emit)
                 found += 1
-        # Suffix sweep: only apply to REAL crawled endpoints (not backup/well-known sources)
-        # and only to paths that look like plain API/file paths (no existing ext like .bak/.env)
+
+        # Suffix sweep: strict SPA-safe validation.
+        # Only run against CONFIRMED/HIGH endpoints whose path looks like a real
+        # file (has a dot or a backend extension) — pure API paths like
+        # /api/v1/users are skipped entirely to avoid sweeping REST routes.
         _SKIP_SOURCES = frozenset({"Backup_Probe", "Backup_Suffix", "WellKnown", "Leaked_File"})
         _EXT_RE = re.compile(r'\.(bak|old|backup|env|sql|zip|tar|gz|swp|tmp|copy|orig|log|conf|ini|yml|yaml)$', re.I)
+
+        # canary_hash already fetched above — reused for suffix sweep
         for ep in list(self.store.all_endpoints()):
             if ep.get("confidence_label") not in ("CONFIRMED", "HIGH"):
                 continue
             # Skip endpoints added by backup/surface probers themselves
-            if any(s in _SKIP_SOURCES for s in ep.get("source", [])):
+            if any(src in _SKIP_SOURCES for src in ep.get("source", [])):
                 continue
             base_url = ep["url"].split("?")[0].rstrip("/")
             # Skip if the path already ends with a backup-like extension
@@ -1952,21 +2056,26 @@ class BackupProber:
             path_part = urlparse(base_url).path
             if not path_part or path_part in ("/", ""):
                 continue
+            # FIX 1 — Only sweep file-like segments (has a dot OR known backend ext).
+            # Pure REST paths like /api/v1/users have no file segment → skip.
+            if not self._FILE_LIKE_RE.search(path_part):
+                continue
             for suf in _BACKUP_SUFFIXES:
                 bak_url = base_url + suf
                 if bak_url in [e["url"] for e in self.store.endpoints.values()]:
                     continue
                 s, hdrs, body = await fetch(self.session, "GET", bak_url, self.rl)
-                if s == 200 and body and len(body) > 10:
-                    ct = (hdrs or {}).get("content-type", "").lower()
-                    # Critical: skip HTML 200s — SPA apps return 200 for everything
-                    if "text/html" in ct and "<html" in body.lower():
-                        continue
-                    self.store.add_endpoint(bak_url, source="Backup_Suffix",
-                                            score=Conf.CONFIRMED)
-                    self.emit.warn(f"[BACKUP-SUFFIX] Exposed: {bak_url}")
-                    Extractor.secrets(body, bak_url, self.store, self.emit)
-                    found += 1
+                if s != 200 or not body:
+                    continue
+                ct = (hdrs or {}).get("content-type", "").lower()
+                # Strict gate: reject SPA catch-all 200s
+                if not self._is_real_file_response(ct, body, canary_hash):
+                    continue
+                self.store.add_endpoint(bak_url, source="Backup_Suffix",
+                                        score=Conf.CONFIRMED)
+                self.emit.warn(f"[BACKUP-SUFFIX] Exposed: {bak_url}")
+                Extractor.secrets(body, bak_url, self.store, self.emit)
+                found += 1
         self.emit.animator.stop()
         if found:
             self.emit.always_success(f"[Backup] {found} exposed files found")
@@ -2380,7 +2489,9 @@ class Spider:
                                 if "text/html" in ct:
                                     self.store.add_endpoint(url, source=f"HTML({source})", score=Conf.MEDIUM)
                                     self._process_html(url, body, depth, source)
-                                    self._extract_body_param_hints(url, body)
+                                    # Body param hints are not run on HTML — the name= pattern fires on
+                                    # every form input (csrf_token, submit, action…) creating noise.
+                                    # Param extraction from HTML is handled by _process_html() → form parser.
                                 elif "javascript" in ct or url.split("?")[0].endswith(".js"):
                                     self.store.add_endpoint(url, source="JS_File", score=Conf.LOW)
                                     await self._process_js(url, body, session)
@@ -2392,12 +2503,22 @@ class Spider:
                                         r'\s*:\s*(-?\d{1,3}\.\d+)',
                                         re.I
                                     )
+                                    # Only flag geo-coordinates when personal-data context is also
+                                    # present in the same response — bare pub coordinates (store
+                                    # locators, weather APIs) are not a privacy leak.
+                                    _GEO_PERSONAL_RE = re.compile(
+                                        r'"(?:user_?id|account_?id|member_?id|email|phone|'
+                                        r'mobile|ssn|national_?id|dob|date_?of_?birth|'
+                                        r'first_?name|last_?name|full_?name)"',
+                                        re.I
+                                    )
                                     for _gm in _GEO_RE.finditer(body):
-                                        self.store.add_secret(
-                                            f"GeoCoord: {_gm.group(0)[:60]}",
-                                            "GeoLocation_Leak", url)
-                                        self.emit.warn(f"[Geo-Leak] Coordinates exposed in response: {url}")
-                                        break  # One warning per endpoint is enough
+                                        if _GEO_PERSONAL_RE.search(body):
+                                            self.store.add_secret(
+                                                f"GeoCoord: {_gm.group(0)[:60]}",
+                                                "GeoLocation_Leak", url)
+                                            self.emit.warn(f"[Geo-Leak] Coordinates + personal data exposed: {url}")
+                                        break  # one check per endpoint is enough
                                     # ── path strings in JSON values ────────────────
                                     for m in re.finditer(r'"([/][a-zA-Z0-9_\-\/]+)"', body):
                                         path = m.group(1)
@@ -2629,7 +2750,13 @@ def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_chec
     opts    = options or {}
     cookies = SessionManager.parse_cookies(opts.get("cookie") or opts.get("auth"))
     xhdrs   = SessionManager.parse_auth_header(opts.get("headers", {}))
-    cfg     = Config(**{k: v for k, v in opts.items() if k not in ("cookie","auth","headers")})
+    # FIX 5: enable_cors defaults to False in framework (module) mode.
+    # CORS probing adds WAF-visible traffic with evil.hellhound.test origin and no
+    # downstream agent currently consumes cors_issues for exploitation.
+    # Callers that explicitly need CORS data should pass enable_cors=True in options.
+    framework_defaults = {"enable_cors": False}
+    merged_opts = {**framework_defaults, **{k: v for k, v in opts.items() if k not in ("cookie","auth","headers")}}
+    cfg     = Config(**merged_opts)
     cfg.validate()
 
     class _W:
