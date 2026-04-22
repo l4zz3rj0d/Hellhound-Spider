@@ -53,12 +53,12 @@ pip uninstall hellhound-spider   # Windows
 
 ---
 
-## v12.0 — High-Fidelity Recon
+## v12.0 — Foundational Discovery
 
-The v12.0 release transitions Hellhound Spider into a professional-grade reconnaissance engine with the following core systems:
+The v12.0 release transitions Hellhound Spider into a professional-grade Foundational Discovery engine, focusing on high-fidelity structural mapping and low-noise intelligence.
 
-1. **Method Oracle**: Automatically discovers mandatory parameter names for REST APIs by switching methods (GET→POST) and parsing validation error bodies.
-2. **Backup Prober**: Scans for exposed configuration and backup files (`.bak`, `.old`, `.env`, `.sql`, `.git/HEAD`) with a strict HTML content-type guard to eliminate SPA false positives.
+1. **Parameter Normalization (Clustering)**: Automatically groups dynamic structural endpoints (e.g., `/user/1` and `/user/2`) into a single cluster (`/user/{val}`) to provide a clean, deduplicated map of the application surface.
+2. **Intelligence Prober (Method Oracle)**: Performs non-intrusive method discovery (PUT, PATCH, DELETE) on high-confidence structural anchors found during the crawl.
 3. **Passive File Extraction**: Extracts references to sensitive file extensions (`.log`, `.bak`, `.sql`, `.env`, `.yaml`) directly from crawled HTML/JS without any active probing.
 4. **Intelligence Classification**: Every discovered endpoint is automatically tagged with security metadata to feed downstream attack modules.
 
@@ -157,8 +157,8 @@ spider https://target.com --diff previous.json
 ### Discovery Vectors
 HTML crawl, live SPA XHR interception, robots.txt, sitemap XML, `.well-known` (OIDC/JWKS), JSON path chaining, SPA hash routes, lazy-load attributes, CSP header hints.
 
-### Parameter Mining
-Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, POST body params from live browser requests, **Method Oracle** (error-body parsing), JSON top-level key inference.
+### Parameter Mining & Clustering
+Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, POST body params from live browser requests, **Intelligent Method Probing**, **Structural Normalization** (Clustering dynamic segments).
 
 ### Passive Security Detection
 
@@ -166,7 +166,6 @@ Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, P
 |---|---|
 | `[SECRET:*]` | API keys, JWTs, Bitcoin/Ethereum addresses, private keys |
 | `[Leaked-File]` | References to `.log`, `.bak`, `.sql`, `.env`, `.yaml` in page content |
-| `[BACKUP]` | Confirmed exposed backup/config files via targeted probe |
 | `[SourceMap]` | Exposed `.js.map` files leaking original source code |
 | `[Tech]` | Server/version headers (Server, X-Powered-By, X-AspNet-Version) |
 | `[CORS]` | Wildcard or reflected CORS misconfiguration |

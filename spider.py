@@ -21,6 +21,7 @@ import re
 import sys
 import time
 import random
+import threading
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -155,34 +156,30 @@ def print_banner():
 # ══════════════════════════════════════════════════════════════════════
 
 class CLIAnimator:
-    """
-    Handles Sample T31 (Case-Wave) and Sample P33 (Braille-Wave).
-    Maintains a sticky status line at the bottom of the terminal.
-    """
     def __init__(self, emit):
         self.emit = emit
         self.active = False
-        self.task = None
-        self.label = ""
-        self.total = 0
+        self._stop_event = threading.Event()
+        self.label = "Working"
         self.current = 0
-        self._nc = emit._nc
-        self._last_line = ""
+        self.total = 0
+        self._nc = _no_color()
+        self._last_line = None
+        self._thread = None
 
-    def start(self, label, total=0):
-        if self._nc: return
+    def start_anim(self, label, total=0):
         self.label = label
         self.total = total
         self.current = 0
         self.active = True
-        if not self.task:
-            self.task = asyncio.create_task(self._animate())
+        self._stop_event.clear()
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self.run, daemon=True)
+            self._thread.start()
 
-    def stop(self):
+    def stop_anim(self):
         self.active = False
-        if self.task:
-            self.task.cancel()
-            self.task = None
+        self._stop_event.set()
         self._clear()
 
     def update(self, current, label=None):
@@ -192,13 +189,16 @@ class CLIAnimator:
     def _clear(self):
         """Clears the status line so a log can be printed above it."""
         if not self._nc and self._last_line:
-            # Move cursor to start, overwrite with spaces, return to start
-            sys.stdout.write("\r" + " " * (len(_strip(self._last_line)) + 10) + "\r")
-            sys.stdout.flush()
+            with self.emit.lock:
+                sys.stdout.write("\r" + " " * (len(_strip(self._last_line)) + 15) + "\r")
+                sys.stdout.flush()
 
-    async def _animate(self):
+    def run(self):
         start_time = time.time()
-        while self.active:
+        while not self._stop_event.is_set():
+            if not self.active:
+                time.sleep(0.1)
+                continue
             try:
                 t = time.time() - start_time
                 
@@ -210,29 +210,46 @@ class CLIAnimator:
                         continue
                     v = math.sin(t * 10 + i * 0.4)
                     if v > 0:
-                        anim_label += f"{C.R}{C.B}{c.upper()}{C.RST}"
+                        anim_label += f"{C.R}{C.B}{c.upper()}{C.RST}" if not self._nc else c.upper()
                     else:
-                        anim_label += f"{C.RD}{c.lower()}{C.RST}"
+                        anim_label += f"{C.RD}{c.lower()}{C.RST}" if not self._nc else c.lower()
 
-                # P33: Braille-Wave for Progress (15 character bar per spec)
-                bar_w = 15
+                # P33: Braille-Wave for Progress (Scaled to 'Ultra-Wide' 50 character bar)
+                bar_w = 50
                 chars = "⡀⡄⡆⡇⣇⣧⣷⣿"
                 bar = ""
                 for i in range(bar_w):
-                    idx = int((math.sin(t * 5 + i * 0.3) + 1) / 2 * (len(chars) - 1))
-                    bar += f"{C.R}{chars[idx]}{C.RST}"
+                    idx = int((math.sin(t * 5 + i * 0.2) + 1) / 2 * (len(chars) - 1))
+                    bar += f"{C.R}{chars[idx]}{C.RST}" if not self._nc else "."
 
-                stats = f"{C.W}{self.current}/{self.total}{C.RST}"
-                # Format: [*] <Case-Wave Label>  <Braille-Wave Bar> <Current/Total Stats>
-                line = f"\r {C.CY}[*]{C.RST} {anim_label}  {bar} {stats}"
+                if self.total:
+                    stats = f"{C.W}{self.current:>3}/{self.total:<3}{C.RST}" if not self._nc else f"{self.current}/{self.total}"
+                else:
+                    # Pulsing red '---' for reconnaissance phases
+                    v = math.sin(t * 8)
+                    if not self._nc:
+                        c = C.R if v > 0 else C.RD
+                        stats = f"{c}---{C.RST}"
+                    else:
+                        stats = "---"
+
+                line = f"\r  {anim_label:<25}  {bar}  {stats}" if not self._nc else f"\r  {self.label} {self.current}/{self.total}"
+                
+                # Harden: Pad with spaces if shorter than previous line
+                if self._last_line and len(_strip(line)) < len(_strip(self._last_line)):
+                    pad = " " * (len(_strip(self._last_line)) - len(_strip(line)) + 5)
+                else:
+                    pad = "    "
+                
                 self._last_line = line
-                sys.stdout.write(line)
-                sys.stdout.flush()
-                await asyncio.sleep(0.06)
-            except asyncio.CancelledError:
-                break
+                # SYNC: Use lock for output
+                with self.emit.lock:
+                    sys.stdout.write(line + pad)
+                    sys.stdout.flush()
+                
+                time.sleep(0.06)
             except Exception:
-                await asyncio.sleep(0.5)
+                time.sleep(0.5)
 
 # ══════════════════════════════════════════════════════════════════════
 # EMIT
@@ -250,17 +267,22 @@ class Emit:
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
         self._nc     = _no_color()
+        self.lock    = threading.Lock()
         self.animator = CLIAnimator(self)
 
     # ── raw write ─────────────────────────────────────────────────────
 
     def _w(self, line: str):
-        if self.animator.active:
-            self.animator._clear()
-            print(_strip(line) if self._nc else line, flush=True)
-            # The animator task will redraw the status line in its next loop
-        else:
-            print(_strip(line) if self._nc else line, flush=True)
+        # SYNC: Acquire lock to prevent animation from writing during log emission
+        with self.lock:
+            if self.animator.active:
+                # Clear animator's current line
+                if self.animator._last_line:
+                    sys.stdout.write("\r" + " " * (len(_strip(self.animator._last_line)) + 15) + "\r")
+                print(_strip(line) if self._nc else line, flush=True)
+                # Animator will redraw in its own thread loop
+            else:
+                print(_strip(line) if self._nc else line, flush=True)
 
     # ── log helpers ───────────────────────────────────────────────────
 
@@ -346,12 +368,11 @@ class Emit:
             "CONFIRMED": C.G, "HIGH": C.Y, "MEDIUM": C.CYD, "LOW": C.GR,
         }.get(conf, C.GR)
 
-        disp = url if len(url) <= 72 else url[:69] + "..."
-
+        # No OSC 8 wrapping: prevents dotted underlines in some terminals
         if self._nc:
-            print(f"    {method:<7}  {conf:<10}  {_strip(auth)}{_strip(sens)}  {disp}")
+            print(f"    {method:<7}  {conf:<10}  {_strip(auth)}{_strip(sens)}  {url}")
         else:
-            print(f"  {mc}{method:<7}{C.RST} {cc}{conf:<10}{C.RST} {auth}{sens} {C.W}{disp}{C.RST}")
+            print(f"  {mc}{method:<7}{C.RST} {cc}{conf:<10}{C.RST} {auth}{sens} {C.W}{url}{C.RST}")
 
     def print_always(self, msg: str):
         self._w(msg)
@@ -383,18 +404,23 @@ def print_results(intel: dict, target: str, elapsed: float,
             return f"{C.G}{C.B}{v}{C.RST}" if not nc else str(v)
         return str(v)
 
-    # ── top header ────────────────────────────────────────────────────
+    # ── meta ──────────────────────────────────────────────────────────
     print()
-    if nc:
-        print(f"  ══ SCAN COMPLETE ══  {target}")
+    meta = intel.get("meta", {})
+    if not nc:
+        emit.section(f"TARGET  {meta.get('target')}")
     else:
-        bar = "═" * 72
-        tgt = target[:60] + "…" if len(target) > 60 else target
-        print(f"  {C.R}{C.B}{bar}{C.RST}")
-        print(f"  {C.R}{C.B}  SCAN COMPLETE{C.RST}  {C.GR}·{C.RST}  {C.W}{tgt}{C.RST}")
-        print(f"  {C.R}{C.B}{bar}{C.RST}")
+        print(f"[*] Target: {meta.get('target')}")
 
-    # -- final summary
+    if not nc:
+        emit.row("Structure",  f"{s.get('total_endpoints')} Clusters discovered", value_colour=C.CY)
+        emit.row("Confidence", f"{int(s.get('confirmed', 0))} high-fidelity anchors", value_colour=C.CY)
+        emit.row("Threads",    "12", value_colour=C.CY) # Simplified
+    else:
+        print(f"[*] Clusters:   {s.get('total_endpoints')}")
+        print(f"[*] High-fid:   {s.get('confirmed')}")
+
+    # ── final summary ──
     _NOISE_SRCS = frozenset({"Backup_Probe", "Backup_Suffix", "WellKnown", "Leaked_File"})
     _real_eps   = [e for e in eps if not all(src in _NOISE_SRCS for src in e.get("source", ["Crawl"]))]
     _backup_eps = [e for e in eps if all(src in _NOISE_SRCS for src in e.get("source", ["Crawl"]))]
@@ -456,13 +482,13 @@ def print_results(intel: dict, target: str, elapsed: float,
     if eps:
         emit.section(f"ENDPOINTS  ({len(eps)} discovered)", orbital=True)
 
-        # column header
+        # column header re-aligned with endpoint_row (2-space indent)
         if nc:
-            print(f"    {'METHOD':<7}  {'CONFIDENCE':<10}  FLAGS  URL")
-            print(f"    {'──'*33}")
+            print(f"  {'METHOD':<7}  {'CONFIDENCE':<10}  FLAGS  URL")
+            print(f"  {'──'*34}")
         else:
-            print(f"    {C.GL}{'METHOD':<7}  {'CONFIDENCE':<10}  FLAGS  URL{C.RST}")
-            print(f"    {C.GR}{'──'*33}{C.RST}")
+            print(f"  {C.GL}{'METHOD':<7}  {'CONFIDENCE':<10}  FLAGS  URL{C.RST}")
+            print(f"  {C.GR}{'──'*34}{C.RST}")
 
         order = {"CONFIRMED": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
         _NOISE_SOURCES = frozenset({"Backup_Probe", "Backup_Suffix", "WellKnown", "Leaked_File"})
@@ -538,7 +564,7 @@ def print_results(intel: dict, target: str, elapsed: float,
     if not nc:
         bar = "─" * 72
         ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"  {C.R}◓{C.RST} {C.B}{C.W}HELLHOUND SPIDER v{VERSION}{C.RST} {C.GR}·{C.RST} {C.W}complete{C.RST} {C.GR}·{C.RST} {C.W}{ts}{C.RST}")
+        print(f"  {C.R}◓{C.RST} {C.B}{C.W}HELLHOUND SPIDER v{VERSION}{C.RST} {C.GR}·{C.RST} {C.W}foundational{C.RST} {C.GR}·{C.RST} {C.W}{ts}{C.RST}")
         print(f"  {C.GR}{bar}{C.RST}\n")
     else:
         print(f"  HELLHOUND SPIDER v{VERSION} · complete · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -580,6 +606,12 @@ class Config:
         self.enable_spa_interact = kw.get("enable_spa_interact", False)
         self.enable_probing     = kw.get("enable_probing",     True)
         self.enable_method_disc = kw.get("enable_method_disc", True)
+        self.extensions_to_ignore = kw.get("extensions_to_ignore", [
+            ".jpg", ".jpeg", ".png", ".gif", ".ico", ".svg", ".css", ".js.map",
+            ".woff", ".woff2", ".ttf", ".eot", ".mp3", ".mp4", ".wav", ".avi",
+            ".pdf", ".docx", ".xlsx", ".pptx", ".zip", ".tar.gz", ".rar",
+            ".webp", ".mov", ".webm", ".exe", ".dmg", ".apk", ".bmp", ".tiff"
+        ])
         self.enable_graphql     = kw.get("enable_graphql",     True)
         self.enable_openapi     = kw.get("enable_openapi",     True)
         self.enable_cors        = kw.get("enable_cors",        True)
@@ -590,12 +622,6 @@ class Config:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
-        self.extensions_to_ignore: List[str] = kw.get("extensions_to_ignore", [
-            ".png",".jpg",".jpeg",".gif",".ico",".svg",".webp",
-            ".woff",".woff2",".ttf",".eot",".css",
-            ".mp4",".mp3",".avi",".mov",".webm",
-            ".zip",".gz",".tar",".rar",".pdf",".exe",".dmg",".apk",
-        ])
 
     def validate(self):
         if not (0 <= self.max_depth <= 20):
@@ -732,6 +758,21 @@ _ID_RE = re.compile(
     re.I
 )
 
+_NUMERIC_ID_RE = re.compile(r'(?:id|uid|uuid|userid|account|key)$', re.I)
+_PATH_ID_RE    = re.compile(r'/(?:v[0-9]+/)?(?:[a-z]+/)?([0-9]{3,}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', re.I)
+_UUID_PATH_RE  = re.compile(r'[a-f0-9]{8}-[a-f0-9]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[a-f0-9]{12}', re.I)
+
+_ADMIN_PATTERNS = re.compile(r'/(admin|manage|panel|control|dashboard|backend|config|setup|root|superuser)', re.I)
+_AUTH_PATTERNS  = {
+    "login":  re.compile(r'/(login|signin|authenticate|auth)', re.I),
+    "logout": re.compile(r'/(logout|signout)', re.I),
+    "mfa":    re.compile(r'/(mfa|2fa|otp|totp)', re.I),
+    "pass":   re.compile(r'/(password|reset|forgot)', re.I),
+}
+
+_SQLI_PARAM_RE = re.compile(r'(?:id|select|report|update|query|search|from|where|order|by|group|limit|offset|slug|category|tag)$', re.I)
+_CMDI_PARAM_RE = re.compile(r'(?:cmd|command|exec|execute|path|file|dir|folder|target|host|url|endpoint|run|script|sh|bash|run)$', re.I)
+
 def normalize(url: str) -> str:
     try:
         p  = urlparse(url)
@@ -742,10 +783,16 @@ def normalize(url: str) -> str:
         return url
 
 def cluster(url: str) -> str:
+    """Groups similar URLs by masking dynamic path segments and query parameter values."""
     try:
         p    = urlparse(url)
-        segs = ["{id}" if _ID_RE.match(s) else s for s in p.path.split("/")]
-        return urlunparse((p.scheme, p.netloc, "/".join(segs), "", "", ""))
+        # 1. Mask dynamic path segments (UUIDs, digits, etc)
+        segs = ["{val}" if _ID_RE.match(s) else s for s in p.path.split("/")]
+        path = "/".join(segs)
+        # 2. Mask query parameter values
+        qs_dict = parse_qs(p.query, keep_blank_values=True)
+        masked_qs = urlencode(sorted([(k, "") for k in qs_dict.keys()]), doseq=True)
+        return urlunparse(("", "", path, "", masked_qs, ""))
     except Exception:
         return url
 
@@ -949,6 +996,9 @@ class Store:
                 ep["observed_status"].append(status)
             if status in (401, 403):
                 ep["auth_required"] = True
+            elif status == 200:
+                # If we saw a 200, it's not strictly 'walled' for this session
+                ep["auth_required"] = False
 
     def mark_sensitive(self, url, method):
         key = self._key(url, method)
@@ -1107,6 +1157,57 @@ class Extractor:
         r'(?:fetch|axios|\.\s*(?:get|post|put|delete|patch))\s*\(\s*["\']([/][^"\'#\s]{3,})["\']',
     ]
 
+    # HTML markers that indicate a catch-all SPA 200 response rather than a real file
+    _SPA_BODY_MARKERS = (
+        "<html", "<!doctype", "<head", "<body",
+        "<title", "<meta", "<!-- ", "ng-app",
+        "data-reactroot", "__next_data__",
+    )
+
+    # Common strings indicating a soft 404 / Cannot GET error
+    _SOFT_404_INDICATORS = (
+        "cannot get", "not found", "404 not found", "page not found",
+        "route not found", "no route matches", "error 404", "invalid path",
+    )
+
+    @classmethod
+    def is_real_file(cls, ct: str, body: str, canary_hash: str) -> bool:
+        """Return True only if the response looks like a genuine file (not an SPA catch-all)."""
+        if "text/html" in ct:
+            return False
+        body_lo = body.lower()
+        if any(marker in body_lo for marker in cls._SPA_BODY_MARKERS):
+            return False
+        if len(body) <= 50:
+            return False
+        if canary_hash:
+            body_hash = hashlib.md5(body.encode(errors="ignore")).hexdigest()
+            if body_hash == canary_hash:
+                return False
+        return True
+
+    @classmethod
+    def is_soft_404(cls, body: str, status: int) -> bool:
+        """Return True if the response body indicates a non-existent route (Soft 404)."""
+        if status != 200:
+            return False
+        body_lo = body.lower()
+        # Only check short bodies for "Cannot GET" to avoid false positives in large pages
+        if len(body) < 1000:
+            if any(ind in body_lo for ind in cls._SOFT_404_INDICATORS):
+                return True
+        # JSON errors: {"error": "Not Found"}
+        if body.strip().startswith("{"):
+            try:
+                data = json.loads(body)
+                if isinstance(data, dict):
+                    msg = str(data.get("error", "") or data.get("message", "") or data.get("detail", "")).lower()
+                    if any(ind in msg for ind in cls._SOFT_404_INDICATORS):
+                        return True
+            except Exception:
+                pass
+        return False
+
     @classmethod
     def _obj_keys(cls, block):
         keys = re.findall(r'["\']?([a-zA-Z_$][a-zA-Z0-9_$]*)["\']?\s*:', block)
@@ -1154,12 +1255,24 @@ class Extractor:
                     return urljoin(base_url, vpath.split("?")[0])
         return base_url
 
+    # JS libraries internal params stop-list
+    _JS_PARAM_STOPLIST = frozenset({
+        "alignmentOffset", "centerOffset", "referenceHiddenOffsets", "escapedOffsets",
+        "referenceHidden", "overflows", "placement", "enabled", "mode", "index",
+        "length", "name", "type", "id", "value", "target", "action", "method",
+        "enctype", "viewport", "charset", "description", "keywords", "author",
+    })
+
     @classmethod
     def js_params(cls, text, base_url, store, emit):
         var_map = cls._build_var_url_map(text)
         for pat in cls._PARAM_RE:
             for m in re.finditer(pat, text, re.S):
                 keys = cls._obj_keys(m.group(1) if m.lastindex else m.group(0))
+                if not keys:
+                    continue
+                # Harden: filter out high-noise JS library params
+                keys = [k for k in keys if k not in cls._JS_PARAM_STOPLIST]
                 if not keys:
                     continue
                 turl = cls._find_url_for_params(text, m.start(), m.end(), base_url, var_map)
@@ -1264,7 +1377,65 @@ class Extractor:
                 emit.info(f"[CSP-3rd-party] {tok}")
 
 # ══════════════════════════════════════════════════════════════════════
-# GRAPHQL PROBER
+_WELL_KNOWN_PATHS = [
+    ".well-known/security.txt",
+    ".well-known/assetlinks.json",
+    ".well-known/apple-app-site-association",
+    ".well-known/change-password",
+    ".well-known/jwks.json",
+    ".well-known/openid-configuration",
+    ".well-known/oauth-authorization-server",
+    ".well-known/mta-sts.txt",
+    ".well-known/webfinger",
+    ".well-known/dnt-policy.txt",
+]
+
+# ══════════════════════════════════════════════════════════════════════
+# INTELLIGENT PROBER
+# ══════════════════════════════════════════════════════════════════════
+
+class IntelligentProber:
+    _METHODS = ["PUT", "PATCH", "DELETE", "HEAD", "TRACE"]
+
+    def __init__(self, session, store, emit, rl, cfg):
+        self.session = session; self.store = store
+        self.emit = emit; self.rl = rl; self.cfg = cfg
+
+    async def run(self):
+        # Filter for high-confidence endpoints or those with parameters
+        all_eps = self.store.all_endpoints()
+        targets = [
+            e for e in all_eps
+            if (e.get("confidence", 0) >= Conf.MEDIUM or 
+                any(e.get("params",{}).values()))
+        ]
+        
+        if not targets:
+            return
+
+        self.emit.always_info(f"[*] Phase: Intelligent Probing… ({len(targets)} endpoints)")
+        self.emit.animator.start_anim("Intelligent Probing", total=len(targets))
+        
+        new_methods_count = 0
+        for i, ep in enumerate(targets):
+            self.emit.animator.update(i+1)
+            url = ep["url"]
+            known_methods = ep.get("methods", ["GET"])
+            
+            # Method Oracle: Probing for hidden API capabilities
+            if self.cfg.enable_method_disc:
+                test_set = [m for m in self._METHODS if m not in known_methods]
+                for m in test_set:
+                    s, h, t = await fetch(self.session, m, url, self.rl)
+                    if s in (200, 201, 204, 401, 403):
+                        if self.store.update_methods(url, [m]):
+                            new_methods_count += 1
+                        if s in (401, 403):
+                            self.store.record_status(url, m, s)
+
+        self.emit.animator.stop_anim()
+        self.emit.always_info(f"[✓] Probing done — new methods: {new_methods_count}")
+
 # ══════════════════════════════════════════════════════════════════════
 
 _GQL_PATHS = ["/graphql","/api/graphql","/gql","/query","/v1/graphql","/graphiql","/playground"]
@@ -1341,223 +1512,6 @@ async def probe_openapi(session, base, store, emit, rl):
 # INTELLIGENT PROBER
 # ══════════════════════════════════════════════════════════════════════
 
-class IntelligentProber:
-    _METHODS = ["PUT", "PATCH", "DELETE", "HEAD", "TRACE"]
-
-    # Param names to exclude from method oracle results (form/browser noise)
-    _ORACLE_NOISE = frozenset({
-        "viewport", "description", "author", "keywords", "charset",
-        "submit", "button", "action", "method", "enctype",
-    })
-
-    def __init__(self, session, store, emit, rl, cfg):
-        self.session = session; self.store = store
-        self.emit = emit; self.rl = rl; self.cfg = cfg
-
-    async def run(self):
-        self.emit.always_info("Phase: Intelligent Probing…")
-
-        _slug_re = re.compile(r'^[a-z][a-z0-9]{3,9}$')
-
-        def _is_slug_path(url: str) -> bool:
-            segs = urlparse(url).path.strip("/").split("/")
-            return any(
-                _slug_re.match(seg) and not seg.isalpha() and not seg.isdigit()
-                for seg in segs
-            )
-
-        def _has_params(ep: dict) -> bool:
-            return any(ep.get("params",{}).get(b) for b in ("form","js","openapi","query","runtime"))
-
-        all_eps = self.store.all_endpoints()
-        targets = [
-            e for e in all_eps
-            if (
-                e.get("confidence", 0) >= Conf.MEDIUM
-                or _has_params(e)
-                or _is_slug_path(e.get("url",""))
-            )
-        ]
-        # Sort by confidence descending, cap at 100
-        targets = sorted(targets, key=lambda e: e.get("confidence", 0), reverse=True)[:100]
-
-        self.emit.always_info(f"[Prober] {len(targets)} endpoints selected for probing")
-        self.emit.animator.start("Intelligent Probing", total=len(targets))
-        n_sens = n_meth = 0
-        for i, ep in enumerate(targets):
-            self.emit.animator.update(i+1)
-            url = ep["url"]; method = ep["methods"][0]
-            s, hdrs, body = await fetch(self.session, method, url, self.rl)
-            if s is None: continue
-            self.store.record_status(url, method, s)
-            bh = hashlib.md5(body.encode(errors="ignore")).hexdigest()
-            ep["baseline"] = {"status": s, "hash": bh, "length": len(body)}
-            probe = url + ("&" if "?" in url else "?") + f"_hh={int(time.time())}"
-            s2, _, b2 = await fetch(self.session, method, probe, self.rl)
-            if s2 and b2:
-                h2 = hashlib.md5(b2.encode(errors="ignore")).hexdigest()
-                if h2 != bh or abs(len(b2) - len(body)) > 50:
-                    self.store.mark_sensitive(url, method)
-                    self.emit.warn(f"[Sensitive] Param-reactive: {url}")
-                    n_sens += 1
-            if self.cfg.enable_method_disc:
-                found = await self._methods(url, hdrs or {})
-                if found:
-                    self.store.update_methods(url, found)
-                    self.emit.info(f"[Methods] {url} → {', '.join(found)}")
-                    n_meth += 1
-
-                # Method Oracle — only enrich endpoints that already have at least
-                # one known param (from form/js/openapi/query/SPA buckets).
-                # Running oracle on zero-param endpoints hallucinate param names
-                # from generic error pages ("field is required", "invalid input").
-                if _has_params(ep):
-                    oracle_params = await self._method_oracle_params(url)
-                    if oracle_params:
-                        changed = self.store.add_runtime_params(url, method, oracle_params)
-                        if changed:
-                            self.emit.info(f"[MethodOracle] Params discovered: {oracle_params} ← {url}")
-            if self.cfg.enable_cors:
-                await self._cors(url)
-        self.emit.animator.stop()
-        self.emit.always_success(f"Probing done — sensitive: {n_sens}, new methods: {n_meth}")
-
-    async def _methods(self, url, base_hdrs):
-        found = []
-        _, hdrs, _ = await fetch(self.session, "OPTIONS", url, self.rl)
-        if hdrs:
-            allow = hdrs.get("Allow","") or hdrs.get("allow","")
-            if allow:
-                return [m for m in self._METHODS if m in allow]
-        for m in self._METHODS:
-            s, _, _ = await fetch(self.session, m, url, self.rl,
-                                   data="{}", headers={"Content-Type":"application/json"})
-            if s is not None and s not in (405, 501, 400, 404):
-                found.append(m)
-        return found
-
-    async def _cors(self, url):
-        evil = "https://evil.hellhound.test"
-        _, hdrs, _ = await fetch(self.session, "GET", url, self.rl, headers={"Origin": evil})
-        if not hdrs: return
-        acao = hdrs.get("Access-Control-Allow-Origin","") or hdrs.get("access-control-allow-origin","")
-        acac = (hdrs.get("Access-Control-Allow-Credentials","") or
-                hdrs.get("access-control-allow-credentials","")).lower() == "true"
-        if not acao:
-            return
-        # Blanket wildcard with no credentials = low-signal global policy.
-        # Only report it once per domain (stored on the prober instance) to avoid
-        # flooding 70+ identical MEDIUM findings on apps like Juice Shop.
-        if acao == "*" and not acac:
-            domain = urlparse(url).netloc
-            if not hasattr(self, "_cors_wildcard_domains"):
-                self._cors_wildcard_domains = set()
-            if domain in self._cors_wildcard_domains:
-                return  # already reported for this domain
-            self._cors_wildcard_domains.add(domain)
-            self.store.add_cors(url, evil, acao, acac)
-            self.emit.warn(f"[CORS:MEDIUM] {domain} — blanket wildcard origin policy (first endpoint: {url})")
-            return
-        # Origin-reflected or wildcard-with-credentials → report every endpoint (genuine risk)
-        if acao == evil or acac:
-            sev = "HIGH" if acac else "MEDIUM"
-            self.store.add_cors(url, evil, acao, acac)
-            self.emit.warn(f"[CORS:{sev}] {url} — origin reflected, creds={acac}")
-
-    async def _method_oracle_params(self, url: str) -> List[str]:
-        """
-        Switch method from GET→POST and parse the error body for parameter names.
-        Returns a list of discovered parameter names (may be empty).
-        """
-        discovered = []
-
-        # Try POST with empty JSON body first (REST APIs)
-        s, _, body = await fetch(
-            self.session, "POST", url, self.rl,
-            data="{}",
-            headers={"Content-Type": "application/json"},
-        )
-        if body:
-            discovered += self._parse_oracle_body(body)
-
-        # If nothing found, try POST with empty form body (traditional apps)
-        if not discovered:
-            s2, _, body2 = await fetch(
-                self.session, "POST", url, self.rl,
-                data="",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            if body2:
-                discovered += self._parse_oracle_body(body2)
-
-        # Deduplicate and filter noise
-        seen = set()
-        result = []
-        for n in discovered:
-            nl = n.lower()
-            if nl in self._ORACLE_NOISE or nl in seen:
-                continue
-            seen.add(nl)
-            result.append(n)
-        return result
-
-    def _parse_oracle_body(self, body: str) -> List[str]:
-        """
-        Extract parameter names from error/validation response bodies.
-        Handles JSON structured errors AND plain text error messages.
-        """
-        found = []
-
-        # --- JSON structured errors ---
-        try:
-            obj = json.loads(body)
-            def _mine(o, depth=0):
-                if depth > 4:
-                    return
-                if isinstance(o, dict):
-                    for k, v in o.items():
-                        # FastAPI/Pydantic loc arrays
-                        if k == "loc" and isinstance(v, list):
-                            for item in v:
-                                if isinstance(item, str) and item not in ("body","query","path","__root__"):
-                                    found.append(item)
-                        # Missing/required arrays
-                        elif k in ("missing","required","fields","params","parameters","expected") and isinstance(v, list):
-                            for item in v:
-                                if isinstance(item, str) and len(item) <= 60:
-                                    found.append(item)
-                        # Nested error objects: {"errors": {"fieldname": "msg"}}
-                        elif k in ("errors","error","validation","detail") and isinstance(v, dict):
-                            found.extend(vk for vk in v.keys() if isinstance(vk, str))
-                        elif isinstance(v, (dict, list)):
-                            _mine(v, depth + 1)
-                elif isinstance(o, list):
-                    for item in o:
-                        _mine(item, depth + 1)
-            _mine(obj)
-        except Exception:
-            pass
-
-        # --- Plain text / HTML error messages ---
-        text_patterns = [
-            r"""(?:missing|required|invalid|unknown|bad)\s+(?:field|param|parameter|key|argument)[:\s]+["']?([a-zA-Z_][a-zA-Z0-9_]{2,40})["']?""",
-            r"""["']([a-zA-Z_][a-zA-Z0-9_]{2,40})["']\s+(?:is required|is missing|not found|is invalid|cannot be blank)""",
-            r"""(?:field|param|parameter|argument)[:\s]+["']?([a-zA-Z_][a-zA-Z0-9_]{2,40})["']?""",
-            r"""(?:provide|supply|include|send)\s+(?:a\s+)?["']?([a-zA-Z_][a-zA-Z0-9_]{2,40})["']?""",
-        ]
-        # Common English words that appear as the *next token* after
-        # "provide/send/include" in plain-text error messages but are NOT param names.
-        _ORACLE_STOPWORDS = frozenset({
-            "valid", "invalid", "proper", "correct", "non", "empty", "full",
-            "request", "response", "body", "json", "data", "value", "values",
-            "your", "the", "this", "that", "all", "any", "each", "both",
-            "additional", "required", "missing", "correct", "appropriate",
-        })
-        for pat in text_patterns:
-            for m in re.finditer(pat, body, re.I):
-                n = m.group(1).strip()
-                if n and len(n) <= 60 and n.lower() not in _ORACLE_STOPWORDS:
-                    found.append(n)
 
         return found
 
@@ -1576,53 +1530,80 @@ class RobotsParser:
 
     async def run(self) -> float:
         url = urljoin(self.base_url, "/robots.txt")
-        s, _, text = await fetch(self.session, "GET", url, self.rl)
+        s, hdrs, text = await fetch(self.session, "GET", url, self.rl)
         if s != 200 or not text:
             return 0.0
+        
+        # Harden: check for soft-404 / catch-all SPA page
+        ct = (hdrs or {}).get("content-type", "").lower()
+        if not Extractor.is_real_file(ct, text, None) or Extractor.is_soft_404(text, s):
+            return 0.0
+
         self.emit.always_info(f"[Robots] Parsing {url}")
-        dis_count = sit_count = 0
+        dis_count = alw_count = sit_count = 0
         for line in text.splitlines():
-            line = line.strip(); lower = line.lower()
+            # Harden: handle comments and whitespace correctly
+            line = line.split("#", 1)[0].strip()
+            if not line: continue
+            lower = line.lower()
+            
             if lower.startswith("crawl-delay:"):
                 try:
-                    self.crawl_delay = float(line.split(":",1)[1].strip())
+                    self.crawl_delay = float(line.split(":", 1)[1].strip())
                     self.emit.always_info(f"[Robots] Crawl-delay: {self.crawl_delay}s — honouring")
-                except ValueError:
+                except (ValueError, IndexError):
                     pass
-            elif lower.startswith("disallow:"):
-                path = line.split(":",1)[1].strip()
-                if not path or path == "/": continue
-                full = urljoin(self.base_url, path)
-                if self.is_valid(full):
-                    self.store.robots_paths.append(path)
-                    self.store.add_endpoint(full, source="Robots_Disallow", score=Conf.MEDIUM)
-                    self.queue.put_nowait((full, 1, "Robots_Disallow"))
-                    dis_count += 1
-                    self.emit.info(f"[Robots] Disallow queued: {path}")
-            elif lower.startswith("allow:"):
-                path = line.split(":",1)[1].strip()
-                if path and path != "/":
+            elif "disallow:" in lower:
+                # Robust split: handle 'Disallow : /' or mixed case
+                try:
+                    path = line.split(":", 1)[1].strip()
+                    if not path: continue
+                    full = urljoin(self.base_url, path)
+                    if self.is_valid(full):
+                        self.store.robots_paths.append(path)
+                        self.store.add_endpoint(full, source="Robots_Disallow", score=Conf.LOW)
+                        if path != "/":
+                            self.queue.put_nowait((full, 1, "Robots_Disallow"))
+                        dis_count += 1
+                        self.emit.info(f"[Robots] Disallow discovery: {path}")
+                except IndexError:
+                    pass
+            elif "allow:" in lower:
+                try:
+                    path = line.split(":", 1)[1].strip()
+                    if not path: continue
                     full = urljoin(self.base_url, path)
                     if self.is_valid(full):
                         self.store.add_endpoint(full, source="Robots_Allow", score=Conf.LOW)
-                        self.queue.put_nowait((full, 1, "Robots_Allow"))
-                        self.emit.info(f"[Robots] Allow queued: {path}")
-            elif lower.startswith("sitemap:"):
-                sitemap_url = line.split(":",1)[1].strip()
-                if not sitemap_url.startswith("http"):
-                    sitemap_url = line.partition(":")[2].strip()
-                await self.parse_sitemap(sitemap_url)
-                sit_count += 1
+                        if path != "/":
+                            self.queue.put_nowait((full, 1, "Robots_Allow"))
+                        alw_count += 1
+                        self.emit.info(f"[Robots] Allow discovery: {path}")
+                except IndexError:
+                    pass
+            elif "sitemap:" in lower:
+                try:
+                    sitemap_url = line.split(":", 1)[1].strip()
+                    if not sitemap_url.startswith("http"):
+                        sitemap_url = line.partition(":")[2].strip()
+                    await self.parse_sitemap(sitemap_url)
+                    sit_count += 1
+                except (IndexError, Exception):
+                    pass
         self.emit.always_info(
-            f"[Robots] Done — {dis_count} disallow, {sit_count} sitemaps, "
-            f"crawl-delay={self.crawl_delay}s")
+            f"[Robots] Done — {dis_count} disallow, {alw_count} allow, {sit_count} sitemaps")
         return self.crawl_delay
 
     async def parse_sitemap(self, sitemap_url: str):
         if sitemap_url in self._sitemap_seen: return
         self._sitemap_seen.add(sitemap_url)
-        s, _, text = await fetch(self.session, "GET", sitemap_url, self.rl)
+        s, hdrs, text = await fetch(self.session, "GET", sitemap_url, self.rl)
         if s != 200 or not text: return
+        
+        # Harden: check for soft-404 / SPA catch-all
+        ct = (hdrs or {}).get("content-type", "").lower()
+        if not Extractor.is_real_file(ct, text, None) or Extractor.is_soft_404(text, s):
+            return
         try:
             root = ET.fromstring(text)
         except ET.ParseError:
@@ -1679,7 +1660,11 @@ class SPAScanner:
                     url = req.url; rtype = req.resource_type; method = req.method or "GET"
                     if rtype in ("fetch","xhr"):
                         hdrs = dict(req.headers or {})
-                        auth = any(h.lower() in ("authorization","cookie","x-auth-token")
+                        # Harden: exclude 'cookie' from the initial auth-wall heuristic.
+                        # Most SPA apps send session cookies with all requests; marking all 
+                        # as 'auth required' is a false positive for public APIs.
+                        # Real auth walls are detected via 401/403 status in record_status().
+                        auth = any(h.lower() in ("authorization", "x-auth-token", "x-api-key")
                                    for h in hdrs)
                         self.store.add_endpoint(url, method=method, source="SPA_XHR",
                                                 score=Conf.CONFIRMED, auth_required=auth)
@@ -1903,185 +1888,6 @@ class SPAScanner:
 # RECON UTILITIES (v12.0)
 # ══════════════════════════════════════════════════════════════════════
 
-_BACKUP_SUFFIXES = [".bak", ".old", ".orig", ".backup", ".tmp",
-                    ".swp", ".save", "~", ".copy", ".1", ".2"]
-_BACKUP_PATHS    = [
-    "/backup.sql", "/dump.sql", "/database.sql", "/db.sql",
-    "/backup.zip", "/site.zip", "/www.tar.gz",
-    "/.git/HEAD", "/.git/config", "/.svn/entries",
-    "/.env", "/.env.bak", "/.env.local", "/.env.production",
-    "/config.php.bak", "/wp-config.php.bak",
-    "/web.config.bak", "/application.yml.bak",
-    "/id_rsa", "/id_rsa.pub", "/.ssh/id_rsa",
-]
-
-_ADMIN_PATTERNS = re.compile(
-    r'/(?:admin|administrator|administration|manage|management|manager|'
-    r'dashboard|control|panel|backend|backoffice|back-office|'
-    r'staff|internal|superuser|root|god|devops|ops|'
-    r'phpmyadmin|pma|adminer|pgadmin|dbadmin|'
-    r'wp-admin|wp-login|cpanel|whm|plesk|'
-    r'kibana|grafana|jenkins|sonarqube|portainer|traefik|'
-    r'swagger|api-docs|graphiql|playground)(?:/|$)',
-    re.I
-)
-
-_AUTH_PATTERNS = {
-    "login":          re.compile(r'/(?:login|signin|sign-in|auth/login|oauth/login)', re.I),
-    "logout":         re.compile(r'/(?:logout|signout|sign-out|auth/logout)', re.I),
-    "register":       re.compile(r'/(?:register|signup|sign-up|create.?account|new.?user)', re.I),
-    "token":          re.compile(r'/(?:token|oauth/token|auth/token|refresh.?token|access.?token)', re.I),
-    "password_reset": re.compile(r'/(?:password.?reset|forgot.?password|reset.?password|recover)', re.I),
-    "mfa":            re.compile(r'/(?:mfa|2fa|otp|totp|verify|confirm)', re.I),
-}
-
-_NUMERIC_ID_RE = re.compile(r'(?:^|[_\-/])(?:id|uid|user_id|order_id|item_id|record_id|object_id)$', re.I)
-# Require ≥3 consecutive digits to avoid matching /v1/, /v2/, /page/1, /404
-# The segment must be at least 3 digits (real DB ids almost always are)
-_PATH_ID_RE    = re.compile(r'/\d{3,12}(?:/|$)')
-_UUID_PATH_RE  = re.compile(r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
-
-# Genuine SQLi-signal params — high-risk identifiers and query-control params.
-# Deliberately excludes pagination (page, limit, from, to, start, end),
-# standard contact fields (name, email, username), and catalog filters
-# (type, category, item, product) — those fire on ~90% of REST endpoints.
-_SQLI_PARAM_RE  = re.compile(
-    r'^(?:id|uid|search|q|query|filter|order|sort|where|group|having)$', re.I
-)
-_CMDI_PARAM_RE  = re.compile(r'^(?:cmd|command|exec|run|shell|ping|host|ip|addr|address|'
-                               r'url|uri|target|dest|src|source|file|path|dir|input|arg)$', re.I)
-
-_WELL_KNOWN_PATHS = [
-    "/.well-known/security.txt",
-    "/.well-known/change-password",
-    "/.well-known/openid-configuration",   # OAuth/OIDC discovery
-    "/.well-known/oauth-authorization-server",
-    "/.well-known/webfinger",
-    "/.well-known/jwks.json",              # JWT public keys — feeds JWT config checker
-    "/.well-known/assetlinks.json",        # Android app links
-    "/.well-known/apple-app-site-association",
-    "/.well-known/mta-sts.txt",
-    "/.well-known/dnt-policy.txt",
-]
-
-class BackupProber:
-    def __init__(self, session, target, store: Store, emit: Emit, rl):
-        self.session = session
-        self.target  = target
-        self.store   = store
-        self.emit    = emit
-        self.rl      = rl
-
-    # HTML markers that indicate a catch-all SPA 200 response rather than a real file
-    _SPA_BODY_MARKERS = (
-        "<html", "<!doctype", "<head", "<body",
-        "<title", "<meta", "<!-- ", "ng-app",
-        "data-reactroot", "__next_data__",
-    )
-
-    # A file-like path segment has a dot OR ends with a backend extension
-    _FILE_LIKE_RE = re.compile(
-        r'(?:\.(?:php|asp|aspx|jsp|py|rb|do|cfm|cgi|pl|lua|go)$|\.[^/]{1,10}$)',
-        re.I
-    )
-
-    def _is_real_file_response(self, ct: str, body: str, canary_hash: str) -> bool:
-        """Return True only if the response looks like a genuine file (not an SPA catch-all)."""
-        # 1. Content-Type must not be text/html
-        if "text/html" in ct:
-            return False
-        # 2. Body must not contain HTML skeleton markers (case-insensitive scan)
-        body_lo = body.lower()
-        if any(marker in body_lo for marker in self._SPA_BODY_MARKERS):
-            return False
-        # 3. Body must be more than 50 bytes
-        if len(body) <= 50:
-            return False
-        # 4. Body must differ from the canary 404 baseline
-        body_hash = hashlib.md5(body.encode(errors="ignore")).hexdigest()
-        if body_hash == canary_hash:
-            return False
-        return True
-
-    async def _fetch_canary_hash(self) -> str:
-        """Fetch a guaranteed-nonexistent URL and return the MD5 of its body.
-        Used to detect SPA catch-all 200 responses during suffix sweep."""
-        canary_url = self.target.rstrip("/") + "/hhscan_canary_404_abc123xyz"
-        _, _, body = await fetch(self.session, "GET", canary_url, self.rl)
-        if body:
-            return hashlib.md5(body.encode(errors="ignore")).hexdigest()
-        return ""
-
-    async def run(self):
-        self.emit.always_info("[Backup] Probing for exposed backup/config files…")
-        self.emit.animator.start("Backup Audit", total=len(_BACKUP_PATHS))
-        found = 0
-
-        # Fetch canary baseline ONCE — used by both path list probe AND suffix sweep
-        canary_hash = await self._fetch_canary_hash()
-
-        for i, path in enumerate(_BACKUP_PATHS):
-            self.emit.animator.update(i+1)
-            url = urljoin(self.target, path)
-            s, hdrs, body = await fetch(self.session, "GET", url, self.rl)
-            if s == 200 and body:
-                ct = (hdrs or {}).get("content-type", "").lower()
-                # Apply the same strict SPA-safe gate used by suffix sweep
-                if not self._is_real_file_response(ct, body, canary_hash):
-                    continue
-                self.store.add_endpoint(url, source="Backup_Probe", score=Conf.CONFIRMED)
-                self.emit.warn(f"[BACKUP] Exposed: {url}  ({len(body)} bytes)")
-                Extractor.secrets(body, url, self.store, self.emit)
-                found += 1
-
-        # Suffix sweep: strict SPA-safe validation.
-        # Only run against CONFIRMED/HIGH endpoints whose path looks like a real
-        # file (has a dot or a backend extension) — pure API paths like
-        # /api/v1/users are skipped entirely to avoid sweeping REST routes.
-        _SKIP_SOURCES = frozenset({"Backup_Probe", "Backup_Suffix", "WellKnown", "Leaked_File"})
-        _EXT_RE = re.compile(r'\.(bak|old|backup|env|sql|zip|tar|gz|swp|tmp|copy|orig|log|conf|ini|yml|yaml)$', re.I)
-
-        # canary_hash already fetched above — reused for suffix sweep
-        for ep in list(self.store.all_endpoints()):
-            if ep.get("confidence_label") not in ("CONFIRMED", "HIGH"):
-                continue
-            # Skip endpoints added by backup/surface probers themselves
-            if any(src in _SKIP_SOURCES for src in ep.get("source", [])):
-                continue
-            base_url = ep["url"].split("?")[0].rstrip("/")
-            # Skip if the path already ends with a backup-like extension
-            if _EXT_RE.search(base_url):
-                continue
-            # Skip bare-root or very short paths
-            path_part = urlparse(base_url).path
-            if not path_part or path_part in ("/", ""):
-                continue
-            # FIX 1 — Only sweep file-like segments (has a dot OR known backend ext).
-            # Pure REST paths like /api/v1/users have no file segment → skip.
-            if not self._FILE_LIKE_RE.search(path_part):
-                continue
-            for suf in _BACKUP_SUFFIXES:
-                bak_url = base_url + suf
-                if bak_url in [e["url"] for e in self.store.endpoints.values()]:
-                    continue
-                s, hdrs, body = await fetch(self.session, "GET", bak_url, self.rl)
-                if s != 200 or not body:
-                    continue
-                ct = (hdrs or {}).get("content-type", "").lower()
-                # Strict gate: reject SPA catch-all 200s
-                if not self._is_real_file_response(ct, body, canary_hash):
-                    continue
-                self.store.add_endpoint(bak_url, source="Backup_Suffix",
-                                        score=Conf.CONFIRMED)
-                self.emit.warn(f"[BACKUP-SUFFIX] Exposed: {bak_url}")
-                Extractor.secrets(body, bak_url, self.store, self.emit)
-                found += 1
-        self.emit.animator.stop()
-        if found:
-            self.emit.always_success(f"[Backup] {found} exposed files found")
-        else:
-            self.emit.always_info("[Backup] No exposed backup files found")
-
 def classify_admin_endpoints(store: Store):
     for ep in store.endpoints.values():
         if _ADMIN_PATTERNS.search(ep["url"]):
@@ -2203,97 +2009,6 @@ class Spider:
         if headers.get("X-Shopify-Stage"):                      tech.add("Shopify")
         if headers.get("x-drupal-cache") or headers.get("X-Drupal-Cache"):
             tech.add("Drupal")
-        if headers.get("x-pingback") or "xmlrpc.php" in body:  tech.add("WordPress")
-        if headers.get("x-generator","").lower().startswith("drupal"):
-            tech.add("Drupal")
-        if "laravel_session" in (headers.get("set-cookie","") or "").lower():
-            tech.add("Laravel")
-        if "django" in (headers.get("set-cookie","") or "").lower():
-            tech.add("Django")
-
-        # ── Body — JavaScript frameworks (strict signals only) ───────────
-        # Next.js — very specific marker
-        if "_next/" in body or "__NEXT_DATA__" in body:         tech.add("Next.js")
-
-        # Nuxt.js — specific marker
-        if "__nuxt" in body or "_nuxt/" in body:                tech.add("Nuxt.js")
-
-        # Angular (modern v2+) — use app-root + angular bundle markers
-        # ng-version appears in dev; angular.json and zone.js appear in prod
-        _is_angular = (
-            "<app-root" in body or
-            "ng-version=" in body or
-            ("zone.js" in body_lo and "angular" in body_lo) or
-            "platformBrowserDynamic" in body or
-            "BrowserModule" in body
-        )
-        if _is_angular:
-            tech.add("Angular")
-
-        # AngularJS (v1.x) — must be an actual HTML attribute, not minified string
-        if re.search(r'<[^>]+\bng-app\b', body) or re.search(r'<[^>]+\bng-controller\b', body):
-            tech.add("AngularJS")
-
-        # React — require specific React DOM markers, NOT just "react"
-        # ReactDOM.render or createRoot are definitive
-        # Exclude if Angular already detected (Angular bundles mention react in comments)
-        _is_react = (
-            "ReactDOM" in body or
-            "react-dom" in body_lo or
-            "__reactFiber" in body or
-            "__reactProps" in body or
-            ("data-reactroot" in body)
-        )
-        if _is_react and "Angular" not in tech:
-            tech.add("React")
-
-        # Vue.js — specific markers
-        if "__vue_app__" in body or "v-bind:" in body or "data-v-" in body:
-            tech.add("Vue.js")
-        elif "vue" in body_lo and "v-app" in body:
-            tech.add("Vue.js")
-
-        # Svelte
-        if "__svelte" in body or "svelte-" in body_lo:         tech.add("Svelte")
-
-        # ── Body — Backend frameworks ────────────────────────────────────
-        if "wp-content" in body or "wp-json" in body or "wp-login" in body:
-            tech.add("WordPress")
-        if "Drupal.settings" in body or "drupal.js" in body_lo:
-            tech.add("Drupal")
-        if "csrfmiddlewaretoken" in body_lo or "django" in body_lo and "__admin" in body_lo:
-            tech.add("Django")
-        if "laravel" in body_lo and ("csrf_token" in body_lo or "blade" in body_lo):
-            tech.add("Laravel")
-        if "rails-ujs" in body_lo or "data-remote=\"true\"" in body_lo:
-            tech.add("Ruby on Rails")
-        if "jsf" in body_lo and "javax.faces" in body_lo:
-            tech.add("Java/JSF")
-
-        # ── Body — Infrastructure/runtime ───────────────────────────────
-        if "socket.io" in body_lo:                              tech.add("Socket.IO")
-        if "graphql" in body_lo and ("__schema" in body or "introspection" in body_lo):
-            tech.add("GraphQL")
-
-        # ── Body — UI libraries ──────────────────────────────────────────
-        # Bootstrap — require the actual CSS class patterns used in markup
-        if re.search(r'class=["\'][^"\']*\b(?:navbar-brand|btn-primary|btn-secondary|col-md-|container-fluid)\b', body):
-            tech.add("Bootstrap")
-        if "jquery" in body_lo and ("$.ajax" in body or "$(document)" in body):
-            tech.add("jQuery")
-        if "material-icons" in body_lo or "mat-" in body_lo:   tech.add("Angular Material")
-
-        new_tech = tech - self.store.tech_stack
-        for t in tech:
-            self.store.tech_stack.add(t)
-        if new_tech:
-            self.emit.always_info(f"[Tech] {', '.join(sorted(new_tech))}")
-
-    async def _check_sourcemap(self, session, js_url):
-        s, _, _ = await fetch(session, "GET", js_url + ".map", self.rl)
-        if s == 200:
-            self.emit.warn(f"[SourceMap] Exposed: {js_url}.map")
-            self.store.add_sourcemap(js_url + ".map", js_url)
 
     def _queue_url(self, url, depth, source):
         if not self.is_valid(url): return
@@ -2482,6 +2197,10 @@ class Spider:
                                     self.store.add_secret(body[:200], "Error_Stack_Trace", url)
                                     self.emit.warn(f"[Error-Leak] Verbose error at {url}")
                             elif s == 200:
+                                if Extractor.is_soft_404(body, s):
+                                    self.emit.info(f"[Soft-404] Dropping non-existent route: {url}")
+                                    continue
+
                                 if depth <= 1:
                                     self._detect_tech(hdrs, body, url)
                                     Extractor.csp_hints(hdrs, url, self.store, self.emit)
@@ -2603,35 +2322,38 @@ class Spider:
         timeout   = aiohttp.ClientTimeout(total=self.cfg.timeout)
         async with aiohttp.ClientSession(headers=req_headers, cookies=self.cookies,
                                           timeout=timeout, connector=connector) as session:
+            # Start persistent status animator
+            self.emit.animator.start_anim("Recon Probing Base")
             if self.cfg.enable_graphql:
                 await probe_graphql(session, self.target, self.store, self.emit, self.rl)
-            if self.cfg.enable_openapi:
-                await probe_openapi(session, self.target, self.store, self.emit, self.rl)
+            self.emit.animator.update(0, "Recon robots.txt")
             robots = RobotsParser(session, self.target, self.store, self.queue,
                                   self.emit, self.rl, self.is_valid)
             crawl_delay = await robots.run()
 
-            # Fix 5: unconditionally probe canonical sitemap paths
-            # (robots.run may have already parsed some — RobotsParser deduplicates by URL)
+            # FOUNDATIONAL RECON: Structural Discovery (Sitemaps + Well-Known)
+            self.emit.animator.update(0, "Recon Sitemaps")
             for _smap in ("/sitemap.xml", "/sitemap_index.xml", "/.well-known/sitemap.xml"):
                 _smap_url = urljoin(self.target, _smap)
                 if _smap_url not in robots._sitemap_seen:
-                    _s, _, _t = await fetch(session, "GET", _smap_url, self.rl)
+                    _s, _h, _t = await fetch(session, "GET", _smap_url, self.rl)
                     if _s == 200 and _t:
-                        await robots.parse_sitemap(_smap_url)
+                        _ct = (_h or {}).get("content-type", "").lower()
+                        if Extractor.is_real_file(_ct, _t, None) and not Extractor.is_soft_404(_t, _s):
+                            await robots.parse_sitemap(_smap_url)
 
-            # Fix 5: Expanded well-known paths (v12.0)
+            self.emit.animator.update(0, "Recon Well-Known")
             for _wk in _WELL_KNOWN_PATHS:
                 _wk_url = urljoin(self.target, _wk)
-                _s, _, _t = await fetch(session, "GET", _wk_url, self.rl)
+                _s, _h, _t = await fetch(session, "GET", _wk_url, self.rl)
                 if _s == 200 and _t:
+                    _ct = (_h or {}).get("content-type", "").lower()
+                    if not Extractor.is_real_file(_ct, _t, None) or Extractor.is_soft_404(_t, _s):
+                        continue
                     self.store.add_endpoint(_wk_url, source="WellKnown", score=Conf.LOW)
                     self.emit.always_success(f"[.well-known] Found: {_wk_url}")
-                    
                     if _wk.endswith("openid-configuration"):
                         await self._probe_oidc(session, self.target)
-
-                    # Extract any URL-like paths from the body
                     for _m in re.finditer(r'(?:^|\s)((?:https?://[^\s]+|/[a-zA-Z0-9_\-/]+))', _t, re.M):
                         _path = _m.group(1).strip()
                         if _path.startswith("/"):
@@ -2650,8 +2372,8 @@ class Spider:
                 f"auth={'yes' if self.cookies or self.extra_headers else 'no'}, "
                 f"seed={self.queue.qsize()} URLs")
             
-            # P33: Sticky footer status during crawl
-            self.emit.animator.start("Crawling Target")
+            # P33: Update animator for crawl phase
+            self.emit.animator.update(0, "Crawling Target")
             
             workers = [asyncio.create_task(self._worker(session, i, crawl_delay))
                        for i in range(self.cfg.concurrency)]
@@ -2668,24 +2390,22 @@ class Spider:
             
             for w in workers: w.cancel()
             status_task.cancel()
-            self.emit.animator.stop()
+            self.emit.animator.stop_anim()
             
             await asyncio.gather(*workers, return_exceptions=True)
+
+            # Phase 3: Intelligent Probing
             if self.cfg.enable_probing:
                 prober = IntelligentProber(session, self.store, self.emit, self.rl, self.cfg)
                 await prober.run()
 
-                # v12.0 Upgrades: Active Probes & Classification
-                backup_probe = BackupProber(session, self.target, self.store, self.emit, self.rl)
-                await backup_probe.run()
-
-                # Run classification passes
-                # No network I/O — pure store operations
-                classify_admin_endpoints(self.store)
-                classify_auth_endpoints(self.store)
-                classify_idor_candidates(self.store)
-                score_injection_candidates(self.store)
-                _flag_upload_endpoints(self.store)
+            # Run classification passes
+            # No network I/O — pure store operations
+            classify_admin_endpoints(self.store)
+            classify_auth_endpoints(self.store)
+            classify_idor_candidates(self.store)
+            score_injection_candidates(self.store)
+            _flag_upload_endpoints(self.store)
 
 # ══════════════════════════════════════════════════════════════════════
 # DIFF ENGINE
