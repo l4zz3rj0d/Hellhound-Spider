@@ -1299,26 +1299,6 @@ class Extractor:
         "/robots", "/sitemap", "/manifest", "/favicon", "/.well-known/",
     )
 
-    @classmethod
-    def exposed_files(cls, text, base_url, store, emit):
-        # Passive discovery of HIGH-SIGNAL backup/leak extensions only.
-        # Deliberately excludes .json, .xml, .yml, .yaml, .txt, .ini, .conf —
-        # those fire on /robots.txt, /manifest.json, /openapi.json etc. (noise).
-        _EXPOSED_RE = r'(?:https?://|//|/)[a-zA-Z0-9_\-\.\/]*\.(?:log|bak|sql|old|zip|tar\.gz|env|swp|dump)\b'
-        _seen = set()
-        for m in re.finditer(_EXPOSED_RE, text, re.I):
-            raw = m.group(0)
-            if raw in _seen: continue
-            _seen.add(raw)
-            if raw.startswith("//"): full = "http:" + raw
-            elif raw.startswith("/"): full = urljoin(base_url, raw)
-            else: full = raw
-            # Skip known-safe path prefixes that every site legitimately exposes
-            path = urlparse(full).path.lower()
-            if any(path.startswith(pfx) for pfx in cls._EXPOSED_SAFE_PREFIXES):
-                continue
-            store.add_endpoint(full, source="Leaked_File", score=Conf.MEDIUM)
-            emit.info(f"[Leaked-File] {full}")
 
     @classmethod
     def js_endpoints(cls, text, base_url, store, emit):
@@ -2103,7 +2083,6 @@ class Spider:
                 Extractor.js_endpoints(tag.string, url, self.store, self.emit)
                 Extractor.js_params(tag.string, url, self.store, self.emit)
                 Extractor.secrets(tag.string, url, self.store, self.emit)
-                Extractor.exposed_files(tag.string, url, self.store, self.emit)
         for form in soup.find_all("form"):
             action = form.get("action") or url
             full   = urljoin(url, action)
@@ -2149,7 +2128,6 @@ class Spider:
         Extractor.secrets(text, url, self.store, self.emit)
         Extractor.js_endpoints(text, url, self.store, self.emit)
         Extractor.js_params(text, url, self.store, self.emit)
-        Extractor.exposed_files(text, url, self.store, self.emit)
         await self._check_sourcemap(session, url)
         for m in re.finditer(r'import\s*\(\s*["\']([^"\']+)["\']', text):
             full = urljoin(url, m.group(1))

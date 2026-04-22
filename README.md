@@ -59,8 +59,7 @@ The v12.0 release transitions Hellhound Spider into a professional-grade Foundat
 
 1. **Parameter Normalization (Clustering)**: Automatically groups dynamic structural endpoints (e.g., `/user/1` and `/user/2`) into a single cluster (`/user/{val}`) to provide a clean, deduplicated map of the application surface.
 2. **Intelligence Prober (Method Oracle)**: Performs non-intrusive method discovery (PUT, PATCH, DELETE) on high-confidence structural anchors found during the crawl.
-3. **Passive File Extraction**: Extracts references to sensitive file extensions (`.log`, `.bak`, `.sql`, `.env`, `.yaml`) directly from crawled HTML/JS without any active probing.
-4. **Intelligence Classification**: Every discovered endpoint is automatically tagged with security metadata to feed downstream attack modules.
+3. **Intelligence Classification**: Every discovered endpoint is automatically tagged with security metadata to feed downstream attack modules.
 
 ---
 
@@ -165,7 +164,6 @@ Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, P
 | Signal | Description |
 |---|---|
 | `[SECRET:*]` | API keys, JWTs, Bitcoin/Ethereum addresses, private keys |
-| `[Leaked-File]` | References to `.log`, `.bak`, `.sql`, `.env`, `.yaml` in page content |
 | `[SourceMap]` | Exposed `.js.map` files leaking original source code |
 | `[Tech]` | Server/version headers (Server, X-Powered-By, X-AspNet-Version) |
 | `[CORS]` | Wildcard or reflected CORS misconfiguration |
