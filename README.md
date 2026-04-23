@@ -60,6 +60,7 @@ The v12.0 release transitions Hellhound Spider into a professional-grade Foundat
 1. **Parameter Normalization (Clustering)**: Automatically groups dynamic structural endpoints (e.g., `/user/1` and `/user/2`) into a single cluster (`/user/{val}`) to provide a clean, deduplicated map of the application surface.
 2. **Intelligence Prober (Method Oracle)**: Performs non-intrusive method discovery (PUT, PATCH, DELETE) on high-confidence structural anchors found during the crawl.
 3. **Intelligence Classification**: Every discovered endpoint is automatically tagged with security metadata to feed downstream attack modules.
+4. **Robots.txt Intelligence**: Parses `robots.txt` for hidden paths, obeys `Crawl-delay`, and scans comments for sensitive credentials or architectural leaks.
 
 ---
 
@@ -154,7 +155,7 @@ spider https://target.com --diff previous.json
 ## What Gets Found
 
 ### Discovery Vectors
-HTML crawl, live SPA XHR interception, robots.txt, sitemap XML, `.well-known` (OIDC/JWKS), JSON path chaining, SPA hash routes, lazy-load attributes, CSP header hints.
+HTML crawl, live SPA XHR interception, **Intelligent Robots Analysis** (Disallow/Allow mapping + Comment Mining), sitemap XML, `.well-known` (OIDC/JWKS), JSON path chaining, SPA hash routes, lazy-load attributes, CSP header hints.
 
 ### Parameter Mining & Clustering
 Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, POST body params from live browser requests, **Intelligent Method Probing**, **Structural Normalization** (Clustering dynamic segments).
@@ -170,6 +171,7 @@ Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, P
 | `[Error-Leak]` | Verbose stack traces or DB errors in 5xx responses |
 | `[Geo-Leak]` | Latitude/longitude coordinates exposed in JSON API responses |
 | `[Auth-wall:*]` | Endpoints requiring authentication (401/403) |
+| `[Robots-Leak]` | Sensitive keywords found in `robots.txt` comments (passwords, internal paths) |
 
 ### Intelligence Classification (v12.0)
 
