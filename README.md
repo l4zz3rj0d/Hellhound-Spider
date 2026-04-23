@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white"/>
-  <img src="https://img.shields.io/badge/version-12.1-red?style=flat-square"/>
+  <img src="https://img.shields.io/badge/version-12.2-red?style=flat-square"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square"/>
 </p>
@@ -53,7 +53,7 @@ pip uninstall hellhound-spider   # Windows
 
 ---
 
-## v12.1 — Robots Intelligence Update
+## v12.2 — Visual Intelligence Update
 
 The v12.0 release transitions Hellhound Spider into a professional-grade Foundational Discovery engine, focusing on high-fidelity structural mapping and low-noise intelligence.
 

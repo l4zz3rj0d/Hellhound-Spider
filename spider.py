@@ -48,7 +48,7 @@ except Exception as e:
 # METADATA
 # ══════════════════════════════════════════════════════════════════════
 
-VERSION      = "12.1"
+VERSION      = "12.2"
 __author__   = "Sree Danush S (L4ZZ3RJ0D)"
 __license__  = "GPLv3"
 __credits__  = ["L4ZZ3RJ0D"]
