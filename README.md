@@ -72,6 +72,23 @@ It uses two crawl engines in parallel: async HTTP workers for speed, and headles
 
 ---
 
+## Interface Preview
+
+<p align="center">
+  <img src="Images/Interface.png" alt="Hellhound Spider Interface" width="800"/>
+</p>
+
+<p align="center">
+  <img src="Images/Discovery.png" alt="Discovery Results" width="800"/>
+</p>
+
+<p align="center">
+  <img src="Images/crawl_details.png" alt="Crawl Details" width="800"/>
+</p>
+
+---
+
+
 ## Usage
 
 ```
