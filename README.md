@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white"/>
-  <img src="https://img.shields.io/badge/version-12.0-red?style=flat-square"/>
+  <img src="https://img.shields.io/badge/version-12.1-red?style=flat-square"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square"/>
 </p>
@@ -53,7 +53,7 @@ pip uninstall hellhound-spider   # Windows
 
 ---
 
-## v12.0 — Foundational Discovery
+## v12.1 — Robots Intelligence Update
 
 The v12.0 release transitions Hellhound Spider into a professional-grade Foundational Discovery engine, focusing on high-fidelity structural mapping and low-noise intelligence.
 
@@ -173,7 +173,7 @@ Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, P
 | `[Auth-wall:*]` | Endpoints requiring authentication (401/403) |
 | `[Robots-Leak]` | Sensitive keywords found in `robots.txt` comments (passwords, internal paths) |
 
-### Intelligence Classification (v12.0)
+### Intelligence Classification (v12.1)
 
 | Tag | Meaning |
 |---|---|

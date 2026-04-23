@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-  HELLHOUND SPIDER  v12.0  —  Standalone Recon Engine
+  HELLHOUND SPIDER  v12.1  —  Standalone Recon Engine
 
   Full SPA + Non-SPA Crawler | robots.txt | sitemap.xml | JS Analysis
 
@@ -48,7 +48,7 @@ except Exception as e:
 # METADATA
 # ══════════════════════════════════════════════════════════════════════
 
-VERSION      = "12.0"
+VERSION      = "12.1"
 __author__   = "Sree Danush S (L4ZZ3RJ0D)"
 __license__  = "GPLv3"
 __credits__  = ["L4ZZ3RJ0D"]
@@ -302,6 +302,26 @@ class Emit:
 
     def always_success(self, msg: str):
         self._w(f"{C.G}{C.B}[✓]{C.RST} {C.B}{msg}{C.RST}")
+
+    def robots_entry(self, directive: str, path: str, queued: bool):
+        """Live tree-feed line per robots.txt path entry."""
+        if self._nc:
+            status = "crawling" if queued else "skipped"
+            print(f"  |  {directive:<10} {path}  [{status}]")
+            return
+        if directive.upper() == "DISALLOW":
+            dc = C.R; icon = "✖"
+        else:
+            dc = C.GD; icon = "✔"
+        status = f"{C.R}crawling{C.RST}" if queued else f"{C.GR}skipped{C.RST}"
+        self._w(f"  {C.GR}├─{C.RST} {dc}{icon} {directive:<10}{C.RST} {C.W}{path:<40}{C.RST}  {C.GR}↳{C.RST} {status}")
+
+    def robots_comment_leak(self, comment: str):
+        """Highlight a sensitive comment found in robots.txt."""
+        if self._nc:
+            print(f"  |  [COMMENT-LEAK] {comment}")
+            return
+        self._w(f"  {C.GR}├─{C.RST} {C.BG_RED} COMMENT LEAK {C.RST} {C.Y}{comment}{C.RST}")
 
     # ── structured output helpers (used by print_results) ────────────
 
@@ -1520,13 +1540,35 @@ class RobotsParser:
             return 0.0
 
         self.emit.always_info(f"[Robots] Parsing {url}")
+        self.emit._w(f"  {C.GR}│{C.RST}")
         dis_count = alw_count = sit_count = 0
-        for line in text.splitlines():
-            # Harden: handle comments and whitespace correctly
-            line = line.split("#", 1)[0].strip()
-            if not line: continue
+
+        # Sensitive keyword patterns for comment scanning
+        _COMMENT_PATTERNS = re.compile(
+            r'(?:password|passwd|secret|token|key|api[_-]?key|db|database|backup|'
+            r'sql|dump|cred|credential|auth|admin|prod|production|staging|internal|'
+            r'private|todo|fixme|note to self|remove|delete|temp|test|debug|'
+            r'mysql|mongo|redis|postgres|s3|bucket|aws|gcp|azure)',
+            re.I
+        )
+
+        for raw_line in text.splitlines():
+            # Extract comment before stripping it
+            comment_text = ""
+            if "#" in raw_line:
+                comment_text = raw_line.split("#", 1)[1].strip()
+            line = raw_line.split("#", 1)[0].strip()
+
+            # Scan comment for sensitive keywords
+            if comment_text and _COMMENT_PATTERNS.search(comment_text):
+                self.store.add_secret(comment_text, "Robots_Comment_Leak",
+                                      urljoin(self.base_url, "/robots.txt"))
+                self.emit.robots_comment_leak(comment_text)
+
+            if not line:
+                continue
             lower = line.lower()
-            
+
             if lower.startswith("crawl-delay:"):
                 try:
                     self.crawl_delay = float(line.split(":", 1)[1].strip())
@@ -1534,31 +1576,34 @@ class RobotsParser:
                 except (ValueError, IndexError):
                     pass
             elif "disallow:" in lower:
-                # Robust split: handle 'Disallow : /' or mixed case
                 try:
                     path = line.split(":", 1)[1].strip()
-                    if not path: continue
+                    if not path:
+                        continue
                     full = urljoin(self.base_url, path)
                     if self.is_valid(full):
                         self.store.robots_paths.append(path)
                         self.store.add_endpoint(full, source="Robots_Disallow", score=Conf.LOW)
-                        if path != "/":
+                        queued = path != "/"
+                        if queued:
                             self.queue.put_nowait((full, 1, "Robots_Disallow"))
                         dis_count += 1
-                        self.emit.info(f"[Robots] Disallow discovery: {path}")
+                        self.emit.robots_entry("Disallow", path, queued)
                 except IndexError:
                     pass
             elif "allow:" in lower:
                 try:
                     path = line.split(":", 1)[1].strip()
-                    if not path: continue
+                    if not path:
+                        continue
                     full = urljoin(self.base_url, path)
                     if self.is_valid(full):
                         self.store.add_endpoint(full, source="Robots_Allow", score=Conf.LOW)
-                        if path != "/":
+                        queued = path != "/"
+                        if queued:
                             self.queue.put_nowait((full, 1, "Robots_Allow"))
                         alw_count += 1
-                        self.emit.info(f"[Robots] Allow discovery: {path}")
+                        self.emit.robots_entry("Allow", path, queued)
                 except IndexError:
                     pass
             elif "sitemap:" in lower:
@@ -1570,6 +1615,8 @@ class RobotsParser:
                     sit_count += 1
                 except (IndexError, Exception):
                     pass
+
+        self.emit._w(f"  {C.GR}└─{C.RST} {C.CYD}queued {dis_count + alw_count} paths for crawl{C.RST}")
         self.emit.always_info(
             f"[Robots] Done — {dis_count} disallow, {alw_count} allow, {sit_count} sitemaps")
         return self.crawl_delay
