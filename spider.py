@@ -300,6 +300,10 @@ class Emit:
     def always_info(self, msg: str):
         self._w(f"{C.CY}[*]{C.RST} {msg}")
 
+    def live_crawl(self, url: str):
+        """Minimalist live-feed line for the discovery queue."""
+        self._w(f"  {C.R}•{C.RST} {C.W}{url}{C.RST}")
+
     def always_success(self, msg: str):
         self._w(f"{C.G}{C.B}[✓]{C.RST} {C.B}{msg}{C.RST}")
 
@@ -377,6 +381,7 @@ class Emit:
         url    = ep.get("url", "")
         auth   = C.RD + "⬢ " if ep.get("auth_required") else "  "
         sens   = C.Y + "⚡ " if ep.get("parameter_sensitive") else "  "
+        snap   = C.CY + "⌖ " if ep.get("screenshot") else "   "
 
         mc = {
             "GET":    C.GD,  "POST":  C.Y,
@@ -390,9 +395,9 @@ class Emit:
 
         # No OSC 8 wrapping: prevents dotted underlines in some terminals
         if self._nc:
-            print(f"    {method:<7}  {conf:<10}  {_strip(auth)}{_strip(sens)}  {url}")
+            print(f"    {method:<7}  {conf:<10}  {_strip(auth)}{_strip(sens)}{_strip(snap)}  {url}")
         else:
-            print(f"  {mc}{method:<7}{C.RST} {cc}{conf:<10}{C.RST} {auth}{sens} {C.W}{url}{C.RST}")
+            print(f"  {mc}{method:<7}{C.RST} {cc}{conf:<10}{C.RST} {auth}{sens}{snap} {C.W}{url}{C.RST}")
 
     def print_always(self, msg: str):
         self._w(msg)
@@ -457,6 +462,10 @@ def print_results(intel: dict, target: str, elapsed: float,
     emit.row("Leaks Found",    str(len(_backup_eps)),   icon="●")
     emit.row("Discovery Space",f"{len(eps)} Endpoints", icon="●")
     emit.row("Auth-Walled",    str(s.get("auth_required", 0)), icon="●")
+    if s.get("extracted_data"):
+        emit.row("Extracted",  str(s.get("extracted_data")),   icon="●", value_colour=C.G)
+    if s.get("screenshots"):
+        emit.row("Screenshots", str(s.get("screenshots")),      icon="●", value_colour=C.CY)
 
     if not nc:
         print(f"\n  {C.B}{C.W}PHASE LOGIC TIMELINE:{C.RST}")
@@ -497,6 +506,29 @@ def print_results(intel: dict, target: str, elapsed: float,
     for item in secrets:
         emit.finding(item.get("type", "Secret"), "HIGH",
                      f"{str(item.get('content',''))[:70]}  ← {item.get('source','')}")
+
+    # ── extraction findings ──
+    extracted = intel.get("extracted_data", [])
+    if extracted:
+        emit.section(f"EXTRACTED DATA  ({len(extracted)} items)", orbital=True)
+        # Group by type for cleaner output
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for item in extracted:
+            grouped[item["type"]].append(item)
+        
+        for dtype, items in grouped.items():
+            count = len(items)
+            emit.row(dtype.replace("_", " "), f"{count} findings", icon="●", label_colour=C.G)
+            
+            # Show all if verbose, else limit to 10
+            limit = count if emit.verbose else 10
+            for item in items[:limit]:
+                val = item["value"]
+                disp = val if len(val) <= 60 else val[:57] + "..."
+                emit.leader_row("  " + disp, item["source_url"])
+            if count > limit:
+                emit.row("  ...", f"{count-limit} more in JSON", icon="○")
 
     # ── endpoints table ───────────────────────────────────────────────
     if eps:
@@ -581,6 +613,11 @@ def print_results(intel: dict, target: str, elapsed: float,
     if saved_path:
         emit.always_success(f"Report saved → {saved_path}")
 
+    screens = intel.get("screenshots", [])
+    if screens:
+        folder = Path(screens[0]["path"]).parent
+        emit.always_success(f"Evidence saved → {len(screens)} screenshots in {folder}")
+
     if not nc:
         bar = "─" * 72
         ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -624,6 +661,9 @@ class Config:
         self.verbose            = kw.get("verbose",            False)
         self.use_playwright     = kw.get("use_playwright",     True)
         self.enable_spa_interact = kw.get("enable_spa_interact", False)
+        self.enable_extraction   = kw.get("enable_extraction",   False)
+        self.enable_screenshots  = kw.get("enable_screenshots",  False)
+        self.screenshot_priority = kw.get("screenshot_priority", "standard")
         self.enable_probing     = kw.get("enable_probing",     True)
         self.enable_method_disc = kw.get("enable_method_disc", True)
         self.extensions_to_ignore = kw.get("extensions_to_ignore", [
@@ -831,6 +871,8 @@ class Store:
         self.graphql:      List[dict]       = []
         self.openapi:      List[dict]       = []
         self.sourcemaps:   List[dict]       = []
+        self.extracted_data: List[dict]     = []
+        self._extracted_seen: Set[tuple]    = set()
 
     def _key(self, url, method):
         return f"{method.upper()}:{cluster(normalize(url))}"
@@ -855,6 +897,7 @@ class Store:
             "sqli_params":          [],
             "cmdi_candidate":       False,
             "cmdi_params":          [],
+            "screenshot":           None,
         }
 
     def add_endpoint(self, url, method="GET", source="Static",
@@ -997,6 +1040,17 @@ class Store:
                     if v and v not in existing:
                         existing.append(v)
 
+    def add_extracted_data(self, dtype, value, source_url):
+        if (dtype, value) not in self._extracted_seen:
+            self._extracted_seen.add((dtype, value))
+            self.extracted_data.append({
+                "type": dtype,
+                "value": value,
+                "source_url": source_url
+            })
+            return True
+        return False
+
     def update_methods(self, url, methods):
         key = self._key(url, methods[0] if methods else "GET")
         if key not in self.endpoints:
@@ -1076,6 +1130,8 @@ class Store:
             "idor_candidates":    sum(1 for e in eps if e.get("idor_candidate")),
             "sqli_candidates":    sum(1 for e in eps if e.get("sqli_candidate")),
             "cmdi_candidates":    sum(1 for e in eps if e.get("cmdi_candidate")),
+            "extracted_data":     len(self.extracted_data),
+            "screenshots":        sum(1 for e in eps if e.get("screenshot")),
         }
         data = {
             "meta": meta, "summary": summary, "endpoints": eps,
@@ -1084,6 +1140,7 @@ class Store:
             "sourcemaps": self.sourcemaps, "comments": self.comments,
             "robots_disallowed": self.robots_paths,
             "tech_stack": sorted(self.tech_stack),
+            "extracted_data": self.extracted_data,
         }
 
         if fmt == "json":
@@ -1159,6 +1216,14 @@ class Extractor:
         (r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----',                      "Private_Key_PEM"),
         (r'["\'](?:password|passwd|secret|api_?key|token)\s*["\']?\s*[:=]\s*["\']([^"\']{6,})["\']',
                                                                            "Hardcoded_Credential"),
+    ]
+
+    _EXTRACTION_PATTERNS = [
+        (re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', re.I), "Email"),
+        (re.compile(r'(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)\d+\.\d+'), "Internal_IP"),
+        (re.compile(r'(\+\d{1,3}[\s-])?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}'), "Phone"),
+        (re.compile(r'(s3://|gs://)[a-z0-9][a-z0-9\-\.]+|[a-z0-9\-]+\.s3\.amazonaws\.com|[a-z0-9\-]+\.blob\.core\.windows\.net', re.I), "Cloud_Bucket"),
+        (re.compile(r'(SQLSTATE|ORA-\d{5}|mysql_fetch|pg_query|MongoError|SequelizeError)', re.I), "Database_Error"),
     ]
     # Placeholder values that appear in docs/templates — not real secrets
     _SECRET_PLACEHOLDERS = frozenset({
@@ -1300,6 +1365,24 @@ class Extractor:
                     emit.info("[JS-Params] %s -> %s" % (keys, turl))
 
     @classmethod
+    def extract_data(cls, body: str, url: str, store, emit):
+        """Passive extraction of emails, IPs, buckets, etc."""
+        # Skip extraction on: vendor bundles > 2MB
+        if len(body) > 2_000_000 and "vendor" in url.lower():
+            return
+
+        counts = defaultdict(int)
+        for pattern, dtype in cls._EXTRACTION_PATTERNS:
+            for match in pattern.finditer(body):
+                val = match.group(0).strip()
+                if val and store.add_extracted_data(dtype, val, url):
+                    counts[dtype] += 1
+        
+        if counts:
+            summary = ", ".join([f"{v} {k.lower().replace('_', ' ')}" for k, v in counts.items()])
+            emit.info(f"[Extract] {summary} ← {url}")
+
+    @classmethod
     def secrets(cls, text, url, store, emit):
         for pat, stype in cls._SECRET_RE:
             for m in re.finditer(pat, text):
@@ -1413,7 +1496,7 @@ class IntelligentProber:
         if not targets:
             return
 
-        self.emit.always_info(f"[*] Phase: Intelligent Probing… ({len(targets)} endpoints)")
+        self.emit.always_info(f"Phase: Intelligent Probing… ({len(targets)} endpoints)")
         self.emit.animator.start_anim("Intelligent Probing", total=len(targets))
         
         new_methods_count = 0
@@ -1653,164 +1736,179 @@ class RobotsParser:
 # ══════════════════════════════════════════════════════════════════════
 
 class SPAScanner:
-    def __init__(self, target_url, store, emit, cookies, extra_headers, queue, is_valid_fn, enable_spa_interact=False):
+    def __init__(self, target_url, store, emit, cookies, extra_headers, queue, is_valid_fn, enable_spa_interact=False, screenshot_cfg=None):
         self.target_url = target_url; self.store = store; self.emit = emit
         self.cookies = cookies; self.extra_headers = extra_headers
         self.queue = queue; self.is_valid = is_valid_fn
         self._enable_spa_interact = enable_spa_interact
+        self.screenshot_cfg = screenshot_cfg
 
     async def run(self):
         if not PLAYWRIGHT_AVAILABLE:
+            if self.screenshot_cfg:
+                self.emit.warn("[Screenshot] Playwright not available — skipping screenshots")
             self.emit.info("[SPA] Playwright not installed — skipping")
-            return
+            return None
         self.emit.always_info("[SPA] Launching headless Chromium…")
         try:
-            async with async_playwright() as pw:
-                browser = await pw.chromium.launch(headless=True, args=[
+            self._pw = await async_playwright().start()
+            browser = await self._pw.chromium.launch(headless=True, args=[
                     "--no-sandbox","--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled"])
-                ctx_args: dict = {"ignore_https_errors": True}
-                if self.cookies:
-                    parsed = urlparse(self.target_url)
-                    ctx_args["storage_state"] = {"cookies": [
-                        {"name":k,"value":v,"domain":parsed.netloc,"path":"/"}
-                        for k, v in self.cookies.items()]}
-                if self.extra_headers:
-                    ctx_args["extra_http_headers"] = self.extra_headers
-                context = await browser.new_context(**ctx_args)
-                await context.route(
-                    re.compile(r'\.(png|jpg|jpeg|gif|svg|ico|woff2?|ttf|css|mp4|mp3)(\?.*)?$'),
-                    lambda route, _: asyncio.create_task(route.abort()))
-                page = await context.new_page()
+            ctx_args: dict = {
+                "ignore_https_errors": True,
+                "viewport": {"width": 1280, "height": 720}
+            }
+            if self.cookies:
+                parsed = urlparse(self.target_url)
+                ctx_args["storage_state"] = {"cookies": [
+                    {"name":k,"value":v,"domain":parsed.netloc,"path":"/"}
+                    for k, v in self.cookies.items()]}
+            if self.extra_headers:
+                ctx_args["extra_http_headers"] = self.extra_headers
+            context = await browser.new_context(**ctx_args)
+            await context.route(
+                re.compile(r'\.(png|jpg|jpeg|gif|svg|ico|woff2?|ttf|css|mp4|mp3)(\?.*)?$'),
+                lambda route, _: asyncio.create_task(route.abort()))
+            page = await context.new_page()
 
-                async def on_request(req):
-                    url = req.url; rtype = req.resource_type; method = req.method or "GET"
-                    if rtype in ("fetch","xhr"):
-                        hdrs = dict(req.headers or {})
-                        # Harden: exclude 'cookie' from the initial auth-wall heuristic.
-                        # Most SPA apps send session cookies with all requests; marking all 
-                        # as 'auth required' is a false positive for public APIs.
-                        # Real auth walls are detected via 401/403 status in record_status().
-                        auth = any(h.lower() in ("authorization", "x-auth-token", "x-api-key")
-                                   for h in hdrs)
-                        self.store.add_endpoint(url, method=method, source="SPA_XHR",
-                                                score=Conf.CONFIRMED, auth_required=auth)
-                        if self.store.merge_headers(url, method, hdrs):
-                            self.emit.info(f"[SPA-Headers] captured for {url}")
-                        # S2: capture POST body params
-                        if method == "POST":
-                            try:
-                                post_data = req.post_data
-                                if post_data:
-                                    try:
-                                        body_obj = json.loads(post_data)
-                                        if isinstance(body_obj, dict):
-                                            self.store.add_endpoint(
-                                                url, method="POST",
-                                                source="SPA_XHR_POST",
-                                                params=list(body_obj.keys()),
-                                                score=Conf.CONFIRMED,
-                                                auth_required=auth,
-                                            )
-                                    except Exception:
-                                        parsed_body = parse_qs(post_data)
-                                        if parsed_body:
-                                            self.store.add_endpoint(
-                                                url, method="POST",
-                                                source="SPA_XHR_POST",
-                                                params=list(parsed_body.keys()),
-                                                score=Conf.CONFIRMED,
-                                                auth_required=auth,
-                                            )
-                            except Exception:
-                                pass
-                        self.emit.success(f"[SPA-XHR] {method} {url}")
-                    elif rtype == "websocket":
-                        self.store.add_endpoint(url, method="WS", source="SPA_WebSocket",
-                                                score=Conf.CONFIRMED)
-                        self.emit.warn(f"[SPA-WS] WebSocket: {url}")
-                    elif rtype == "script" and self.is_valid(url):
-                        self.queue.put_nowait((url, 1, "SPA_Script"))
-
-                page.on("request", on_request)
-
-                # S1: capture XHR response bodies to harvest real object IDs
-                async def on_response(resp):
-                    try:
-                        r_url    = resp.url
-                        r_method = resp.request.method or "GET"
-                        r_status = resp.status
-                        r_rtype  = resp.request.resource_type
-                        if r_rtype not in ("fetch", "xhr"):
-                            return
-                        if r_status not in range(200, 210):
-                            return
-                        ct = (resp.headers.get("content-type") or "").lower()
-                        if "json" not in ct:
-                            return
-                        body = await resp.text()
-                        if not body or len(body) > 512_000:
-                            return
+            async def on_request(req):
+                url = req.url; rtype = req.resource_type; method = req.method or "GET"
+                if rtype in ("fetch","xhr"):
+                    hdrs = dict(req.headers or {})
+                    # Harden: exclude 'cookie' from the initial auth-wall heuristic.
+                    # Most SPA apps send session cookies with all requests; marking all 
+                    # as 'auth required' is a false positive for public APIs.
+                    # Real auth walls are detected via 401/403 status in record_status().
+                    auth = any(h.lower() in ("authorization", "x-auth-token", "x-api-key")
+                               for h in hdrs)
+                    self.store.add_endpoint(url, method=method, source="SPA_XHR",
+                                            score=Conf.CONFIRMED, auth_required=auth)
+                    if self.store.merge_headers(url, method, hdrs):
+                        self.emit.info(f"[SPA-Headers] captured for {url}")
+                    # S2: capture POST body params
+                    if method == "POST":
                         try:
-                            obj = json.loads(body)
+                            post_data = req.post_data
+                            if post_data:
+                                try:
+                                    body_obj = json.loads(post_data)
+                                    if isinstance(body_obj, dict):
+                                        self.store.add_endpoint(
+                                            url, method="POST",
+                                            source="SPA_XHR_POST",
+                                            params=list(body_obj.keys()),
+                                            score=Conf.CONFIRMED,
+                                            auth_required=auth,
+                                        )
+                                except Exception:
+                                    parsed_body = parse_qs(post_data)
+                                    if parsed_body:
+                                        self.store.add_endpoint(
+                                            url, method="POST",
+                                            source="SPA_XHR_POST",
+                                            params=list(parsed_body.keys()),
+                                            score=Conf.CONFIRMED,
+                                            auth_required=auth,
+                                        )
                         except Exception:
-                            return
-                        def _mine_resp(o, depth=0):
-                            if depth > 3 or not isinstance(o, dict):
-                                return
-                            for k, v in o.items():
-                                if re.match(
-                                    r'^(?:id|uid|user_?id|order_?id|basket_?id|'
-                                    r'item_?id|product_?id|address_?id|card_?id)$',
-                                    str(k), re.I
-                                ):
-                                    vstr = str(v) if v is not None else ""
-                                    if re.match(r'^\d{1,12}$', vstr):
-                                        r_key = self.store._key(r_url, r_method)
-                                        if r_key in self.store.endpoints:
-                                            ep  = self.store.endpoints[r_key]
-                                            obs = ep["observed_values"].setdefault(k, [])
-                                            if vstr not in obs:
-                                                obs.append(vstr)
-                                                self.emit.info(
-                                                    f"[SPA-ResponseID] {k}={vstr} ← {r_url}")
-                                if isinstance(v, (dict, list)):
-                                    _mine_resp(v, depth + 1)
-                        if isinstance(obj, list):
-                            for item in obj[:10]:
-                                _mine_resp(item)
-                        else:
-                            _mine_resp(obj)
+                            pass
+                    self.emit.success(f"[SPA-XHR] {method} {url}")
+                elif rtype == "websocket":
+                    self.store.add_endpoint(url, method="WS", source="SPA_WebSocket",
+                                            score=Conf.CONFIRMED)
+                    self.emit.warn(f"[SPA-WS] WebSocket: {url}")
+                elif rtype == "script" and self.is_valid(url):
+                    self.queue.put_nowait((url, 1, "SPA_Script"))
+
+            page.on("request", on_request)
+
+            # S1: capture XHR response bodies to harvest real object IDs
+            async def on_response(resp):
+                try:
+                    r_url    = resp.url
+                    r_method = resp.request.method or "GET"
+                    r_status = resp.status
+                    r_rtype  = resp.request.resource_type
+                    if r_rtype not in ("fetch", "xhr"):
+                        return
+                    if r_status not in range(200, 210):
+                        return
+                    ct = (resp.headers.get("content-type") or "").lower()
+                    if "json" not in ct:
+                        return
+                    body = await resp.text()
+                    if not body or len(body) > 512_000:
+                        return
+                    try:
+                        obj = json.loads(body)
                     except Exception:
-                        pass
-
-                page.on("response", on_response)
-
-                try:
-                    await page.goto(self.target_url, wait_until="networkidle", timeout=20000)
-                except Exception as e:
-                    self.emit.info(f"[SPA] Goto warning: {e}")
-                try:
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(1.5)
-                    await page.evaluate("window.scrollTo(0, 0)")
-                    await asyncio.sleep(0.5)
+                        return
+                    def _mine_resp(o, depth=0):
+                        if depth > 3 or not isinstance(o, dict):
+                            return
+                        for k, v in o.items():
+                            if re.match(
+                                r'^(?:id|uid|user_?id|order_?id|basket_?id|'
+                                r'item_?id|product_?id|address_?id|card_?id)$',
+                                str(k), re.I
+                            ):
+                                vstr = str(v) if v is not None else ""
+                                if re.match(r'^\d{1,12}$', vstr):
+                                    r_key = self.store._key(r_url, r_method)
+                                    if r_key in self.store.endpoints:
+                                        ep  = self.store.endpoints[r_key]
+                                        obs = ep["observed_values"].setdefault(k, [])
+                                        if vstr not in obs:
+                                            obs.append(vstr)
+                                            self.emit.info(
+                                                f"[SPA-ResponseID] {k}={vstr} ← {r_url}")
+                            if isinstance(v, (dict, list)):
+                                _mine_resp(v, depth + 1)
+                    if isinstance(obj, list):
+                        for item in obj[:10]:
+                            _mine_resp(item)
+                    else:
+                        _mine_resp(obj)
                 except Exception:
                     pass
-                # S4: wait for SPA to fully settle before interacting
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=5000)
-                    await asyncio.sleep(1.0)
-                except Exception:
-                    pass
-                if self._enable_spa_interact:
-                    await self._interact(page)
-                await self._harvest_dom(page)
-                await self._harvest_hash(page)
-                await browser.close()
-                self.emit.always_info("[SPA] Dynamic analysis complete")
+
+            page.on("response", on_response)
+
+            try:
+                await page.goto(self.target_url, wait_until="networkidle", timeout=20000)
+            except Exception as e:
+                self.emit.info(f"[SPA] Goto warning: {e}")
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1.5)
+                await page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+            # S4: wait for SPA to fully settle before interacting
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+                await asyncio.sleep(1.0)
+            except Exception:
+                pass
+            if self._enable_spa_interact:
+                await self._interact(page)
+            await self._harvest_dom(page)
+            await self._harvest_hash(page)
+                
+            if self.screenshot_cfg:
+                # Keep browser alive for screenshots later
+                self.emit.always_info("[SPA] SPA harvest complete — keeping browser alive for screenshots")
+                return browser, context, page
+            
+            await browser.close()
+            await self._pw.stop()
+            self.emit.always_info("[SPA] Dynamic analysis complete")
+            return None
         except Exception as e:
             self.emit.warn(f"[SPA] Error: {e}")
+            return None
 
     async def _interact(self, page):
         """
@@ -1905,6 +2003,92 @@ class SPAScanner:
                 self.emit.info(f"[SPA-Hash] {url}")
         except Exception:
             pass
+
+    async def capture_screenshots(self, endpoints, spa_ctx):
+        if not spa_ctx: return
+        browser, context, page = spa_ctx
+        
+        domain = re.sub(r'[^a-zA-Z0-9_\-]', '_', urlparse(self.target_url).netloc)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        priority = self.screenshot_cfg.get("priority", "standard")
+        get_status = lambda e: (e.get("observed_status") or [0])[0]
+        
+        # Preset logic
+        rules = []
+        if priority == "all":
+            rules = [lambda ep: get_status(ep) in (200, 401, 403, 404)]
+        elif priority == "standard":
+            rules = [lambda ep: get_status(ep) in (200, 401, 403) and re.search(r'login|admin|dashboard|upload|graphql|swagger|panel|console', ep["url"], re.I)]
+        elif priority == "blocked":
+            rules = [lambda ep: get_status(ep) in (401, 403)]
+        elif priority == "errors":
+            rules = [lambda ep: get_status(ep) >= 400]
+        elif priority == "api":
+            rules = [lambda ep: get_status(ep) != 404 and re.search(r'/api/|/graphql|/swagger|/openapi', ep["url"], re.I)]
+        elif priority == "admin":
+            rules = [lambda ep: get_status(ep) != 404 and re.search(r'admin|panel|console|manage|backend', ep["url"], re.I)]
+        else:
+            # Custom keywords or regex
+            if "," in priority:
+                keywords = [k.strip() for k in priority.split(",")]
+                rules = [lambda ep: get_status(ep) != 404 and any(k.lower() in ep["url"].lower() for k in keywords)]
+            else:
+                rules = [lambda ep: get_status(ep) != 404 and re.search(priority, ep["url"], re.I)]
+
+        base_dir = Path("screenshots") / domain / priority
+        base_dir.mkdir(parents=True, exist_ok=True)
+        
+        count = 0
+        seen_urls = set()
+        
+        for ep in endpoints.values():
+            url = ep["url"]
+            norm_url = url.split("?")[0].split("#")[0].rstrip("/")
+            if norm_url in seen_urls: continue
+            
+            matched = False
+            reason = ""
+            if priority in ("all", "standard", "blocked", "errors", "api", "admin"):
+                if any(r(ep) for r in rules):
+                    matched = True
+                    reason = f"preset: {priority}"
+            else:
+                if any(r(ep) for r in rules):
+                    matched = True
+                    reason = f"custom match: {priority}"
+            
+            if matched:
+                seen_urls.add(norm_url)
+                sanitized_path = re.sub(r'[^a-zA-Z0-9_\-]', '_', urlparse(url).path.strip("/"))
+                if not sanitized_path: sanitized_path = "root"
+                sanitized_path = sanitized_path[:80]
+                filename = f"{ts}_{sanitized_path}.jpg"
+                filepath = base_dir / filename
+                
+                label = ""
+                if get_status(ep) in (401, 403):
+                    label = " [AUTH WALL]"
+
+                try:
+                    self.emit.info(f"[Screenshot] {url} → {filepath}{label}")
+                    await page.goto(url, wait_until="domcontentloaded", timeout=10000)
+                    await page.screenshot(path=str(filepath), type="jpeg", quality=75)
+                    ep["screenshot"] = {
+                        "path": str(filepath),
+                        "preset": priority,
+                        "reason": reason + label
+                    }
+                    count += 1
+                except Exception as e:
+                    self.emit.warn(f"[Screenshot] Failed {url}: {e}")
+        
+        if count:
+            self.emit.always_success(f"[Screenshot] Captured {count} screenshots to {base_dir}")
+        else:
+            self.emit.warn(f"[Screenshot] No endpoints matched the '{priority}' preset (0 captures)")
+        
+        await browser.close()
+        await self._pw.stop()
 
 # ══════════════════════════════════════════════════════════════════════
 # CORE SPIDER
@@ -2199,10 +2383,15 @@ class Spider:
                     else:
                         self.visited.add(norm)
                         self._depth_cnt[depth] += 1
+                        self.emit.live_crawl(url)
                         s, hdrs, body = await fetch(session, "GET", url, self.rl,
                                                     max_retries=self.cfg.max_retries,
                                                     base_delay=self.cfg.retry_base_delay)
                         if s is not None and body is not None:
+                            # PASSIVE EXTRACTION (all response codes)
+                            if self.cfg.enable_extraction:
+                                Extractor.extract_data(body, url, self.store, self.emit)
+
                             self.store.record_status(url, "GET", s)
                             if s in (401, 403):
                                 self.store.add_endpoint(url, source=source,
@@ -2304,6 +2493,7 @@ class Spider:
                                             if loc.text: self._queue_url(loc.text, depth+1, "XML_Sitemap")
                                     except Exception:
                                         pass
+                                
             except Exception:
                 pass
             finally:
@@ -2347,90 +2537,110 @@ class Spider:
         timeout   = aiohttp.ClientTimeout(total=self.cfg.timeout)
         async with aiohttp.ClientSession(headers=req_headers, cookies=self.cookies,
                                           timeout=timeout, connector=connector) as session:
-            # Start persistent status animator
-            self.emit.animator.start_anim("Recon Probing Base")
-            if self.cfg.enable_graphql:
-                await probe_graphql(session, self.target, self.store, self.emit, self.rl)
-            self.emit.animator.update(0, "Recon robots.txt")
-            robots = RobotsParser(session, self.target, self.store, self.queue,
-                                  self.emit, self.rl, self.is_valid)
-            crawl_delay = await robots.run()
+            try:
+                # Start persistent status animator
+                self.emit.animator.start_anim("Recon Probing Base")
+                if self.cfg.enable_graphql:
+                    await probe_graphql(session, self.target, self.store, self.emit, self.rl)
+                self.emit.animator.update(0, "Recon robots.txt")
+                robots = RobotsParser(session, self.target, self.store, self.queue,
+                                      self.emit, self.rl, self.is_valid)
+                crawl_delay = await robots.run()
 
-            # FOUNDATIONAL RECON: Structural Discovery (Sitemaps + Well-Known)
-            self.emit.animator.update(0, "Recon Sitemaps")
-            for _smap in ("/sitemap.xml", "/sitemap_index.xml", "/.well-known/sitemap.xml"):
-                _smap_url = urljoin(self.target, _smap)
-                if _smap_url not in robots._sitemap_seen:
-                    _s, _h, _t = await fetch(session, "GET", _smap_url, self.rl)
+                # FOUNDATIONAL RECON: Structural Discovery (Sitemaps + Well-Known)
+                self.emit.animator.update(0, "Recon Sitemaps")
+                for _smap in ("/sitemap.xml", "/sitemap_index.xml", "/.well-known/sitemap.xml"):
+                    _smap_url = urljoin(self.target, _smap)
+                    if _smap_url not in robots._sitemap_seen:
+                        _s, _h, _t = await fetch(session, "GET", _smap_url, self.rl)
+                        if _s == 200 and _t:
+                            _ct = (_h or {}).get("content-type", "").lower()
+                            if Extractor.is_real_file(_ct, _t, None) and not Extractor.is_soft_404(_t, _s):
+                                await robots.parse_sitemap(_smap_url)
+
+                self.emit.animator.update(0, "Recon Well-Known")
+                for _wk in _WELL_KNOWN_PATHS:
+                    _wk_url = urljoin(self.target, _wk)
+                    _s, _h, _t = await fetch(session, "GET", _wk_url, self.rl)
                     if _s == 200 and _t:
                         _ct = (_h or {}).get("content-type", "").lower()
-                        if Extractor.is_real_file(_ct, _t, None) and not Extractor.is_soft_404(_t, _s):
-                            await robots.parse_sitemap(_smap_url)
+                        if not Extractor.is_real_file(_ct, _t, None) or Extractor.is_soft_404(_t, _s):
+                            continue
+                        self.store.add_endpoint(_wk_url, source="WellKnown", score=Conf.LOW)
+                        self.emit.always_success(f"[.well-known] Found: {_wk_url}")
+                        if _wk.endswith("openid-configuration"):
+                            await self._probe_oidc(session, self.target)
+                        for _m in re.finditer(r'(?:^|\s)((?:https?://[^\s]+|/[a-zA-Z0-9_\-/]+))', _t, re.M):
+                            _path = _m.group(1).strip()
+                            if _path.startswith("/"):
+                                _full = urljoin(self.target, _path)
+                                if self.is_valid(_full):
+                                    self.store.add_endpoint(_full, source="WellKnown", score=Conf.LOW)
+                                    self._queue_url(_full, 1, "WellKnown")
+                spa_ctx = None
+                if self.cfg.enable_screenshots and not self.cfg.use_playwright:
+                    self.emit.warn("[Screenshot] --screenshot requested but --no-playwright passed. Skipping.")
+                
+                if self.cfg.use_playwright:
+                    screenshot_cfg = {"priority": self.cfg.screenshot_priority} if self.cfg.enable_screenshots else None
+                    spa = SPAScanner(self.target, self.store, self.emit, self.cookies,
+                                     self.extra_headers, self.queue, self.is_valid,
+                                     enable_spa_interact=self.cfg.enable_spa_interact,
+                                     screenshot_cfg=screenshot_cfg)
+                    spa_ctx = await spa.run()
+                self.emit.always_info(
+                    f"[Spider] Crawl started — depth={self.cfg.max_depth}, "
+                    f"concurrency={self.cfg.concurrency}, "
+                    f"auth={'yes' if self.cookies or self.extra_headers else 'no'}, "
+                    f"seed={self.queue.qsize()} URLs")
+                
+                # P33: Update animator for crawl phase
+                self.emit.animator.update(0, "Crawling Target")
+                
+                workers = [asyncio.create_task(self._worker(session, i, crawl_delay))
+                           for i in range(self.cfg.concurrency)]
+                
+                # Dynamic update task for crawl progress
+                async def _update_crawl_status():
+                    while self.emit.animator.active:
+                        self.emit.animator.update(len(self.visited), f"Crawling: {len(self.visited)} URLs")
+                        await asyncio.sleep(1.0)
+                
+                status_task = asyncio.create_task(_update_crawl_status())
+                
+                await self.queue.join()
+                
+                for w in workers: w.cancel()
+                status_task.cancel()
+                self.emit.animator.stop_anim()
+                
+                await asyncio.gather(*workers, return_exceptions=True)
 
-            self.emit.animator.update(0, "Recon Well-Known")
-            for _wk in _WELL_KNOWN_PATHS:
-                _wk_url = urljoin(self.target, _wk)
-                _s, _h, _t = await fetch(session, "GET", _wk_url, self.rl)
-                if _s == 200 and _t:
-                    _ct = (_h or {}).get("content-type", "").lower()
-                    if not Extractor.is_real_file(_ct, _t, None) or Extractor.is_soft_404(_t, _s):
-                        continue
-                    self.store.add_endpoint(_wk_url, source="WellKnown", score=Conf.LOW)
-                    self.emit.always_success(f"[.well-known] Found: {_wk_url}")
-                    if _wk.endswith("openid-configuration"):
-                        await self._probe_oidc(session, self.target)
-                    for _m in re.finditer(r'(?:^|\s)((?:https?://[^\s]+|/[a-zA-Z0-9_\-/]+))', _t, re.M):
-                        _path = _m.group(1).strip()
-                        if _path.startswith("/"):
-                            _full = urljoin(self.target, _path)
-                            if self.is_valid(_full):
-                                self.store.add_endpoint(_full, source="WellKnown", score=Conf.LOW)
-                                self._queue_url(_full, 1, "WellKnown")
-            if self.cfg.use_playwright:
-                spa = SPAScanner(self.target, self.store, self.emit, self.cookies,
-                                 self.extra_headers, self.queue, self.is_valid,
-                                 enable_spa_interact=self.cfg.enable_spa_interact)
-                await spa.run()
-            self.emit.always_info(
-                f"[Spider] Crawl started — depth={self.cfg.max_depth}, "
-                f"concurrency={self.cfg.concurrency}, "
-                f"auth={'yes' if self.cookies or self.extra_headers else 'no'}, "
-                f"seed={self.queue.qsize()} URLs")
-            
-            # P33: Update animator for crawl phase
-            self.emit.animator.update(0, "Crawling Target")
-            
-            workers = [asyncio.create_task(self._worker(session, i, crawl_delay))
-                       for i in range(self.cfg.concurrency)]
-            
-            # Dynamic update task for crawl progress
-            async def _update_crawl_status():
-                while self.emit.animator.active:
-                    self.emit.animator.update(len(self.visited), f"Crawling: {len(self.visited)} URLs")
-                    await asyncio.sleep(1.0)
-            
-            status_task = asyncio.create_task(_update_crawl_status())
-            
-            await self.queue.join()
-            
-            for w in workers: w.cancel()
-            status_task.cancel()
-            self.emit.animator.stop_anim()
-            
-            await asyncio.gather(*workers, return_exceptions=True)
+                # Phase 3: Intelligent Probing
+                if self.cfg.enable_probing:
+                    prober = IntelligentProber(session, self.store, self.emit, self.rl, self.cfg)
+                    await prober.run()
 
-            # Phase 3: Intelligent Probing
-            if self.cfg.enable_probing:
-                prober = IntelligentProber(session, self.store, self.emit, self.rl, self.cfg)
-                await prober.run()
+                # Phase 4: Screenshots
+                if self.cfg.enable_screenshots and spa_ctx:
+                    self.emit.animator.start_anim("Capturing Screenshots")
+                    await spa.capture_screenshots(self.store.endpoints, spa_ctx)
+                    self.emit.animator.stop_anim()
+                elif spa_ctx:
+                    # Cleanup if screenshots not enabled but context was kept (shouldn't happen with current logic but for safety)
+                    b, c, p = spa_ctx
+                    await b.close()
+                    if hasattr(spa, "_pw"): await spa._pw.stop()
 
-            # Run classification passes
-            # No network I/O — pure store operations
-            classify_admin_endpoints(self.store)
-            classify_auth_endpoints(self.store)
-            classify_idor_candidates(self.store)
-            score_injection_candidates(self.store)
-            _flag_upload_endpoints(self.store)
+                # Run classification passes
+                # No network I/O — pure store operations
+                classify_admin_endpoints(self.store)
+                classify_auth_endpoints(self.store)
+                classify_idor_candidates(self.store)
+                score_injection_candidates(self.store)
+                _flag_upload_endpoints(self.store)
+            finally:
+                self.emit.animator.stop_anim()
 
 # ══════════════════════════════════════════════════════════════════════
 # DIFF ENGINE
@@ -2517,6 +2727,7 @@ def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_chec
         def row(self, k, v, **kw):    self._b.info(f"{k}: {_strip(str(v))}")
         def finding(self, *a):        self._b.warn(str(a))
         def endpoint_row(self, ep):   self._b.info(ep.get("url",""))
+        def live_crawl(self, url):    pass
         def print_always(self, m):    print(m)
         @property
         def _nc(self): return True
@@ -2591,16 +2802,17 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             f"\n{C.GR}  ── Examples ────────────────────────────────────────────────────\n\n"
-            f"  python3 spider.py https://target.com\n"
-            f"  python3 spider.py https://target.com --verbose\n"
-            f"  python3 spider.py https://target.com --cookie \"s=abc; csrf=xy\"\n"
-            f"  python3 spider.py https://target.com --cookie /path/cookies.txt\n"
-            f"  python3 spider.py https://target.com --auth \"Bearer eyJhbGci...\"\n"
-            f"  python3 spider.py https://target.com --depth 5 --out report.json\n"
-            f"  python3 spider.py https://target.com --format csv --out e.csv\n"
-            f"  python3 spider.py https://target.com --no-playwright\n"
-            f"  python3 spider.py https://target.com --spa-interact\n"
-            f"  python3 spider.py https://target.com --diff old.json\n"
+            f"{C.R}  spider https://target.com\n"
+            f"  spider https://target.com --extract\n"
+            f"  spider https://target.com --extract --verbose\n"
+            f"  spider https://target.com --screenshot\n"
+            f"  spider https://target.com --screenshot all\n"
+            f"  spider https://target.com --screenshot \"admin,panel\"\n"
+            f"  spider https://target.com --cookie \"s=abc; csrf=xy\"\n"
+            f"  spider https://target.com --auth \"Bearer eyJhbGci...\"\n"
+            f"  spider https://target.com --format csv --out report.csv\n"
+            f"  spider https://target.com --no-playwright\n"
+            f"  spider https://target.com --diff old.json\n"
             f"\n  JSON report is always auto-saved even without --out.{C.RST}\n"
         ),
     )
@@ -2643,6 +2855,10 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Disable GraphQL introspection probe")
     flags.add_argument("--no-openapi",    action="store_true",
                        help="Disable OpenAPI / Swagger discovery")
+    flags.add_argument("--extract",      action="store_true",
+                       help="Enable passive data extraction (emails, IPs, buckets)")
+    flags.add_argument("--screenshot", nargs="?", const="standard",
+                       help="Capture screenshots of key endpoints (default: standard). Optionally specify preset: all, blocked, errors, api, admin, or custom regex")
 
     util = p.add_argument_group(f"{C.CY}Utilities{C.RST}")
     util.add_argument("--diff",    type=str, default=None, metavar="OLD_REPORT",
@@ -2694,6 +2910,12 @@ def main():
     _pf("Verbose",
         "on" if args.verbose else "off",
         C.G if args.verbose else C.GR)
+    _pf("Extraction",
+        "enabled" if args.extract else "disabled",
+        C.G if args.extract else C.GR)
+    _pf("Screenshots",
+        f"enabled ({args.screenshot or 'standard'})" if args.screenshot else "disabled",
+        C.G if args.screenshot else C.GR)
     print()
 
     cookies = SessionManager.parse_cookies(args.cookie)
@@ -2717,6 +2939,9 @@ def main():
         enable_cors     = not args.no_cors,
         enable_graphql  = not args.no_graphql,
         enable_openapi  = not args.no_openapi,
+        enable_extraction = args.extract,
+        enable_screenshots = args.screenshot is not None,
+        screenshot_priority = args.screenshot if args.screenshot else "standard",
         output_format   = args.format,
         output_file     = args.out,
     )

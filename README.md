@@ -88,6 +88,24 @@ It uses two crawl engines in parallel: async HTTP workers for speed, and headles
 
 ---
 
+## Automated Evidence Collection
+
+The spider can automatically capture screenshots of high-value targets (admin panels, login pages, API documentation) during the crawl. While the `--screenshot all` flag captures every discovered endpoint, we have included two samples below for reference:
+
+```bash
+spider http://127.0.0.1:5000 --extract --screenshot all
+```
+
+<p align="center">
+  <img src="Images/spider_screenshot.jpeg" alt="Automated Screenshot 1" width="800"/>
+</p>
+
+<p align="center">
+  <img src="Images/spider_screenshot2.jpg" alt="Automated Screenshot 2" width="800"/>
+</p>
+
+---
+
 
 ## Usage
 
@@ -127,6 +145,8 @@ spider <target> [options]
 | `--no-cors` | Skip CORS checks |
 | `--no-graphql` | Skip GraphQL introspection probe |
 | `--no-openapi` | Skip OpenAPI / Swagger discovery |
+| `--extract` | Enable passive data extraction (emails, IPs, buckets) |
+| `--screenshot` | Capture screenshots of key endpoints. Preset: `all`, `standard`, `blocked`, `errors`, `api`, `admin`, or custom regex |
 
 **Utilities**
 
@@ -160,6 +180,10 @@ spider https://target.com -d 6 --verbose
 # Export for Burp Suite
 spider https://target.com --format burp --out burp.xml
 
+# Extraction & Screenshots
+spider https://target.com --extract --verbose
+spider https://target.com --screenshot all
+
 # No headless browser
 spider https://target.com --no-playwright
 
@@ -189,6 +213,10 @@ Form fields, JS fetch/axios body keys, URL query strings, OpenAPI spec fields, P
 | `[Geo-Leak]` | Latitude/longitude coordinates exposed in JSON API responses |
 | `[Auth-wall:*]` | Endpoints requiring authentication (401/403) |
 | `[Robots-Leak]` | Sensitive keywords found in `robots.txt` comments (passwords, internal paths) |
+| `[Email]` | Extracted email addresses found in JS/HTML content |
+| `[IP]` | Internal RFC1918 IP addresses leaked in content |
+| `[CloudBucket]` | S3, Google Storage, or Azure Blob storage references |
+| `[DB-Error]` | Database error strings leaking architectural details |
 
 ### Intelligence Classification (v12.1)
 
