@@ -300,6 +300,49 @@ class Emit:
     def always_info(self, msg: str):
         self._w(f"{C.CY}[*]{C.RST} {msg}")
 
+    def crawl_feed(self, ftype: str, method: str = "GET", url: str = "", status: int = 0, size_bytes: int = 0, extra: List[str] = None):
+        """Live crawl feed — clean, minimal, no status noise."""
+        # URL truncation: keep path readable, middle-ellipsis at 65 chars
+        disp_url = url
+        if len(url) > 65:
+            disp_url = url[:32] + "…" + url[-30:]
+
+        if self._nc:
+            if ftype == "Found":
+                print(f"  ↳  {disp_url}")
+            else:
+                print(f"  {ftype}  {disp_url}")
+            if extra:
+                for ex in extra: print(f"       {ex}")
+            return
+
+        # Label color
+        if ftype == "Found":
+            tcol = C.G;  label = f"{tcol}↳{C.RST}"
+        elif ftype == "JS":
+            tcol = C.Y;  label = f"{tcol}[ JS ]{C.RST}"
+        else:
+            tcol = C.CY; label = f"{tcol}[ ↓  ]{C.RST}"
+
+        if ftype == "Found":
+            # Clean discovery line — just the URL, green arrow
+            self._w(f"  {label} {C.W}{disp_url}{C.RST}")
+        else:
+            # Crawl/JS fetch line — URL only, status as subtle dot color
+            if status == 200:
+                dot = f"{C.G}●{C.RST}"
+            elif status in (401, 403):
+                dot = f"{C.R}●{C.RST}"
+            elif status and status >= 400:
+                dot = f"{C.Y}●{C.RST}"
+            else:
+                dot = f"{C.GR}●{C.RST}"
+            self._w(f"  {label} {dot} {C.W}{disp_url}{C.RST}")
+
+        if extra:
+            for ex in extra:
+                self._w(f"       {C.GR}{ex}{C.RST}")
+
     def live_crawl(self, url: str):
         """Minimalist live-feed line for the discovery queue."""
         self._w(f"  {C.R}•{C.RST} {C.W}{url}{C.RST}")
@@ -376,8 +419,8 @@ class Emit:
 
     def endpoint_row(self, ep: dict):
         """Minimalist Endpoint Row (Cinematic Dashboard)."""
-        method = ep.get("methods", ["GET"])[0]
-        conf   = ep.get("confidence_label", "LOW")
+        method = ep.get("method", "GET")
+        conf   = ep.get("confidence", "LOW")
         url    = ep.get("url", "")
         auth   = C.RD + "⬢ " if ep.get("auth_required") else "  "
         sens   = C.Y + "⚡ " if ep.get("parameter_sensitive") else "  "
@@ -452,7 +495,7 @@ def print_results(intel: dict, target: str, elapsed: float,
     
     # Calculate score (Simplified)
     total_findings = sum([len(intel.get(k,[])) for k in ["secrets","cors_issues","graphql","openapi","sourcemaps"]])
-    confirmed = sum(1 for e in _real_eps if e.get("confidence_label") == "CONFIRMED")
+    confirmed = sum(1 for e in _real_eps if e.get("confidence") == "CONFIRMED")
     score = max(0, 10.0 - (total_findings * 0.4) - (len(_backup_eps) * 0.1))
     
     emit.section("SUMMARY", orbital=True)
@@ -546,7 +589,7 @@ def print_results(intel: dict, target: str, elapsed: float,
         _NOISE_SOURCES = frozenset({"Backup_Probe", "Backup_Suffix", "WellKnown", "Leaked_File"})
         real_eps = [e for e in eps if not all(s in _NOISE_SOURCES for s in e.get("source", ["Crawl"]))]
         backup_eps = [e for e in eps if all(s in _NOISE_SOURCES for s in e.get("source", ["Crawl"]))]
-        sorted_eps = sorted(real_eps, key=lambda e: (order.get(e.get("confidence_label", "LOW"), 4), e.get("url", ""))) + \
+        sorted_eps = sorted(real_eps, key=lambda e: (order.get(e.get("confidence", "LOW"), 4), e.get("url", ""))) + \
                      sorted(backup_eps, key=lambda e: e.get("url", ""))
         shown    = sorted_eps[:200]
         overflow = len(sorted_eps) - len(shown)
@@ -558,19 +601,16 @@ def print_results(intel: dict, target: str, elapsed: float,
             emit.row("...", f"{overflow} more — see JSON report", icon="○")
 
         # ── param map for interesting endpoints ──────────────────────
-        interesting = [e for e in real_eps if (any(e.get("params",{}).get(b) for b in ("form","js","openapi","query","runtime")) or e.get("parameter_sensitive"))][:40]
+        interesting = [e for e in real_eps if (e.get("params") or e.get("parameter_sensitive"))][:40]
 
         if interesting:
             emit.section(f"PARAMETER MAP  ({len(interesting)} endpoints)", orbital=True)
             for ep in interesting:
                 url = ep.get("url","")
-                all_p: List[str] = []
-                for b in ("form","js","openapi","query","runtime"):
-                    all_p += ep.get("params",{}).get(b,[])
-                all_p = list(dict.fromkeys(all_p))
+                all_p = ep.get("params", [])
                 if not all_p: continue
 
-                method = ep.get("methods",["GET"])[0]
+                method = ep.get("method", "GET")
                 mc = { "GET": C.GD, "POST": C.Y, "PUT": C.O, "PATCH": C.O, "DELETE": C.R }.get(method, C.GL)
                 disp = url if len(url) <= 64 else url[:61] + "…"
 
@@ -1131,16 +1171,57 @@ class Store:
             "sqli_candidates":    sum(1 for e in eps if e.get("sqli_candidate")),
             "cmdi_candidates":    sum(1 for e in eps if e.get("cmdi_candidate")),
             "extracted_data":     len(self.extracted_data),
+            "robots_disallowed":  len(self.robots_paths),
             "screenshots":        sum(1 for e in eps if e.get("screenshot")),
         }
+        
+        # FIX 1 & 2: Format endpoints for export
+        formatted_eps = []
+        for e in eps:
+            # Flat params merge
+            all_params = []
+            for bucket in e["params"].values():
+                for p in bucket:
+                    if p not in all_params: all_params.append(p)
+            
+            # Confidence label mapping
+            c = e["confidence"]
+            if c >= 10: cl = "CONFIRMED"
+            elif c >= 7: cl = "HIGH"
+            elif c >= 3: cl = "MEDIUM"
+            elif c >= 1: cl = "LOW"
+            else: cl = "UNKNOWN"
+
+            formatted_eps.append({
+                "url": e["url"],
+                "method": e["methods"][0] if e["methods"] else "GET",
+                "confidence": cl,
+                "confidence_score": c,
+                "observed_status": e["observed_status"],
+                "params": sorted(all_params),
+                "params_detail": e["params"],
+                "auth_required": e["auth_required"],
+                "source": e["source"],
+                "admin_panel": e.get("admin_panel", False),
+                "auth_classification": e.get("auth_classification", []),
+                "file_upload_candidate": e.get("file_upload_candidate", False),
+                "idor_candidate": e.get("idor_candidate", False),
+                "idor_signals": e.get("idor_signals", {}),
+                "sqli_candidate": e.get("sqli_candidate", False),
+                "sqli_params": e.get("sqli_params", []),
+                "cmdi_candidate": e.get("cmdi_candidate", False),
+                "cmdi_params": e.get("cmdi_params", []),
+                "screenshot": e.get("screenshot"),
+            })
+
         data = {
-            "meta": meta, "summary": summary, "endpoints": eps,
+            "meta": meta, "summary": summary, "endpoints": formatted_eps,
             "secrets": self.secrets, "cors_issues": self.cors_issues,
             "graphql": self.graphql, "openapi": self.openapi,
             "sourcemaps": self.sourcemaps, "comments": self.comments,
             "robots_disallowed": self.robots_paths,
             "tech_stack": sorted(self.tech_stack),
-            "extracted_data": self.extracted_data,
+            "extracted_data": self.extracted_data if self.extracted_data is not None else [],
         }
 
         if fmt == "json":
@@ -1158,7 +1239,7 @@ class Store:
             w   = csv.writer(buf)
             w.writerow(["url","cluster","methods","confidence","auth_required",
                          "param_sensitive","sources","query_params","form_params",
-                         "js_params","openapi_params","status_codes","headers"])
+                         "js_params","openapi_params","observed_status","headers"])
             for ep in eps:
                 w.writerow([ep["url"], ep["cluster"], "|".join(ep["methods"]),
                              ep["confidence_label"], ep["auth_required"],
@@ -1219,11 +1300,33 @@ class Extractor:
     ]
 
     _EXTRACTION_PATTERNS = [
-        (re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', re.I), "Email"),
-        (re.compile(r'(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)\d+\.\d+'), "Internal_IP"),
-        (re.compile(r'(\+\d{1,3}[\s-])?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}'), "Phone"),
-        (re.compile(r'(s3://|gs://)[a-z0-9][a-z0-9\-\.]+|[a-z0-9\-]+\.s3\.amazonaws\.com|[a-z0-9\-]+\.blob\.core\.windows\.net', re.I), "Cloud_Bucket"),
-        (re.compile(r'(SQLSTATE|ORA-\d{5}|mysql_fetch|pg_query|MongoError|SequelizeError)', re.I), "Database_Error"),
+        (re.compile(
+            r'(?<![a-zA-Z0-9])([a-zA-Z0-9._%+-]{2,}@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6})(?![a-zA-Z0-9])',
+            re.I), "Email"),
+        (re.compile(
+            r'(?<!\d)(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|'
+            r'172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|'
+            r'192\.168\.\d{1,3}\.\d{1,3})(?!\d)'),
+            "Internal_IP"),
+        (re.compile(
+            r'(?:phone|mobile|tel|fax|contact|cell|ph|'
+            r'whatsapp|viber|call|hotline|helpline|support)'
+            r'[\s:="\'#\-]*'
+            r'(\+?[\d][\d\s.\-\(\)\/]{6,25}\d)',
+            re.I), "Phone"),
+        (re.compile(
+            r'(s3://|gs://)[a-z0-9][a-z0-9\-\.]+|'
+            r'[a-z0-9\-]+\.s3\.amazonaws\.com|'
+            r'[a-z0-9\-]+\.blob\.core\.windows\.net',
+            re.I), "Cloud_Bucket"),
+        (re.compile(
+            r'(SQLSTATE|ORA-\d{5}|mysql_fetch|pg_query|'
+            r'MongoError|SequelizeError|mysqli_error)',
+            re.I), "DB_Error"),
+        (re.compile(
+            r'\b(?!localhost\b)(?!127\.)[a-zA-Z0-9\-]+'
+            r'\.(internal|intranet|corp|lan|private)\b',
+            re.I), "Internal_Host"),
     ]
     # Placeholder values that appear in docs/templates — not real secrets
     _SECRET_PLACEHOLDERS = frozenset({
@@ -1289,8 +1392,8 @@ class Extractor:
                     msg = str(data.get("error", "") or data.get("message", "") or data.get("detail", "")).lower()
                     if any(ind in msg for ind in cls._SOFT_404_INDICATORS):
                         return True
-            except Exception:
-                pass
+            except Exception as e:
+                self.emit.warn(f"[Worker] Error processing {url}: {e}")
         return False
 
     @classmethod
@@ -1372,11 +1475,65 @@ class Extractor:
             return
 
         counts = defaultdict(int)
+        # Skip raw body phone scan for JSON responses — raw JSON keys like
+        # "order_number", "tracking_number" pollute phone context. Use flatten only.
+        _is_json_body = body.strip().startswith(('{', '['))
         for pattern, dtype in cls._EXTRACTION_PATTERNS:
+            if dtype == "Phone" and _is_json_body:
+                continue  # handled exclusively in JSON flatten branch below
             for match in pattern.finditer(body):
-                val = match.group(0).strip()
-                if val and store.add_extracted_data(dtype, val, url):
+                # Phone pattern has capture group 1 — use it to avoid including keyword context
+                val = (match.group(1) if dtype == "Phone" and match.lastindex else match.group(0)).strip()
+                if not val:
+                    continue
+                
+                # FIX 5: Email post-match filter
+                if dtype == "Email":
+                    local_part = val.split("@")[0]
+                    domain_part = val.split("@")[1] if "@" in val else ""
+                    if ".." in val: continue
+                    if len(local_part) < 2: continue
+                    if "." not in domain_part: continue
+                    if val.lower().endswith((".css", ".js", ".png", ".jpg", ".svg", ".woff")):
+                        continue
+
+                if dtype == "Phone":
+                    val = re.sub(r'[\s.\-\(\)\/]', '', val)
+                    if not (7 <= len(val) <= 15): continue
+                    if not re.match(r'\+?\d+$', val): continue
+                    # Reject date-like patterns: YYYYMMDD, YYYYDDMM, DDMMYYYY etc
+                    if re.match(r'(20[0-9]{2}[01][0-9][0-3][0-9]|[0-3][0-9][01][0-9]20[0-9]{2})', val): continue
+
+                if store.add_extracted_data(dtype, val, url):
                     counts[dtype] += 1
+
+        # IMPROVEMENT 2: Extract from JSON API responses
+        if body.strip().startswith('{') or body.strip().startswith('['):
+            try:
+                obj = json.loads(body)
+                def _flatten_strings(o, depth=0):
+                    if depth > 6: return
+                    if isinstance(o, str): yield o
+                    elif isinstance(o, dict):
+                        for v in o.values(): yield from _flatten_strings(v, depth+1)
+                    elif isinstance(o, list):
+                        for item in o: yield from _flatten_strings(item, depth+1)
+                flat_text = '\n'.join(_flatten_strings(obj))
+                for pattern, dtype in cls._EXTRACTION_PATTERNS:
+                    if dtype in ('Email', 'Phone', 'Cloud_Bucket', 'Internal_IP'):
+                        for m in pattern.finditer(flat_text):
+                            v = m.group(1) if m.lastindex else m.group(0)
+                            if v:
+                                if dtype == "Phone":
+                                    v = re.sub(r'[\s.\-\(\)\/]', '', v)
+                                    if not (7 <= len(v) <= 15): continue
+                                    if not re.match(r'\+?\d+$', v): continue
+                                    # Reject date-like patterns
+                                    if re.match(r'(20[0-9]{2}[01][0-9][0-3][0-9]|[0-3][0-9][01][0-9]20[0-9]{2})', v): continue
+                                if store.add_extracted_data(dtype, v.strip(), url):
+                                    counts[dtype] += 1
+            except Exception:
+                pass
         
         if counts:
             summary = ", ".join([f"{v} {k.lower().replace('_', ' ')}" for k, v in counts.items()])
@@ -1445,6 +1602,19 @@ class Extractor:
                     or bool(re.match(r'^[/\.][a-z0-9_\-\.#]{3,}', txt))):
                 if store.add_comment(txt, url):
                     emit.info(f"[Comment] {txt[:100]}")
+                    # IMPROVEMENT 3: Run patterns on comments
+                    for pat, dtype in cls._EXTRACTION_PATTERNS:
+                        if dtype in ('Email', 'Phone'):
+                            for m in pat.finditer(txt):
+                                v = m.group(1) if m.lastindex else m.group(0)
+                                if v:
+                                    if dtype == "Phone":
+                                        v = re.sub(r'[\s.\-\(\)\/]', '', v)
+                                        if not (7 <= len(v) <= 15): continue
+                                        if not re.match(r'\+?\d+$', v): continue
+                                        # Reject date-like patterns
+                                        if re.match(r'(20[0-9]{2}[01][0-9][0-3][0-9]|[0-3][0-9][01][0-9]20[0-9]{2})', v): continue
+                                    store.add_extracted_data(dtype, v.strip(), url)
 
     @classmethod
     def csp_hints(cls, headers, base_url, store, emit):
@@ -1537,8 +1707,8 @@ async def probe_graphql(session, base, store, emit, rl):
                 types  = schema.get("data",{}).get("__schema",{}).get("types",[])
                 store.graphql.append({"url": url, "types_count": len(types), "schema": schema})
                 emit.warn(f"[GraphQL] {len(types)} types exposed — disable introspection!")
-            except Exception:
-                pass
+            except Exception as e:
+                self.emit.warn(f"[Worker] Error processing {url}: {e}")
             return
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1617,10 +1787,11 @@ class RobotsParser:
         if s != 200 or not text:
             return 0.0
         
-        # Harden: check for soft-404 / catch-all SPA page
         ct = (hdrs or {}).get("content-type", "").lower()
-        if not Extractor.is_real_file(ct, text, None) or Extractor.is_soft_404(text, s):
-            return 0.0
+        is_robots = "text/plain" in ct or url.endswith("/robots.txt")
+        if not is_robots:
+            if not Extractor.is_real_file(ct, text, None) or Extractor.is_soft_404(text, s):
+                return 0.0
 
         self.emit.always_info(f"[Robots] Parsing {url}")
         self.emit._w(f"  {C.GR}│{C.RST}")
@@ -1884,14 +2055,14 @@ class SPAScanner:
                 await asyncio.sleep(1.5)
                 await page.evaluate("window.scrollTo(0, 0)")
                 await asyncio.sleep(0.5)
-            except Exception:
-                pass
+            except Exception as e:
+                self.emit.warn(f"[Worker] Error processing {url}: {e}")
             # S4: wait for SPA to fully settle before interacting
             try:
                 await page.wait_for_load_state("networkidle", timeout=5000)
                 await asyncio.sleep(1.0)
-            except Exception:
-                pass
+            except Exception as e:
+                self.emit.warn(f"[Worker] Error processing {url}: {e}")
             if self._enable_spa_interact:
                 await self._interact(page)
             await self._harvest_dom(page)
@@ -1928,8 +2099,8 @@ class SPAScanner:
                             await asyncio.sleep(0.4)
                     except Exception:
                         pass
-            except Exception:
-                pass
+            except Exception as e:
+                self.emit.warn(f"[Worker] Error processing {url}: {e}")
 
         # Phase 2: fill and submit visible forms
         try:
@@ -2011,14 +2182,17 @@ class SPAScanner:
         domain = re.sub(r'[^a-zA-Z0-9_\-]', '_', urlparse(self.target_url).netloc)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         priority = self.screenshot_cfg.get("priority", "standard")
-        get_status = lambda e: (e.get("observed_status") or [0])[0]
+        def get_status(e):
+            obs = e.get("observed_status") or []
+            if 200 in obs: return 200
+            return max(obs) if obs else 0
         
         # Preset logic
         rules = []
         if priority == "all":
             rules = [lambda ep: get_status(ep) in (200, 401, 403, 404)]
         elif priority == "standard":
-            rules = [lambda ep: get_status(ep) in (200, 401, 403) and re.search(r'login|admin|dashboard|upload|graphql|swagger|panel|console', ep["url"], re.I)]
+            rules = [lambda ep: get_status(ep) == 200 or re.search(r'login|admin|dashboard|upload|graphql|swagger|panel|console', ep["url"], re.I)]
         elif priority == "blocked":
             rules = [lambda ep: get_status(ep) in (401, 403)]
         elif priority == "errors":
@@ -2090,10 +2264,6 @@ class SPAScanner:
         await browser.close()
         await self._pw.stop()
 
-# ══════════════════════════════════════════════════════════════════════
-# CORE SPIDER
-# ══════════════════════════════════════════════════════════════════════
-
 
 # ══════════════════════════════════════════════════════════════════════
 # RECON UTILITIES (v12.0)
@@ -2162,6 +2332,7 @@ class Spider:
         self.base_domain = urlparse(target).netloc
         self.store = Store()
         self.visited: Set[str] = set()
+        self._crawl_feed_seen: Set[str] = set()
         self.queue: asyncio.Queue = asyncio.Queue()
         self.sem = asyncio.Semaphore(cfg.concurrency)
         self.rl = DomainRateLimiter()
@@ -2227,6 +2398,16 @@ class Spider:
         if norm in self.visited: return
         self.store.add_query_params(url)
         self.queue.put_nowait((url, depth, source))
+
+    def _discover_url(self, url, depth, source, show_feed=False):
+        if not self.is_valid(url): return False
+        norm = normalize(url)
+        if norm in self.visited: return False
+        if show_feed and norm not in self._crawl_feed_seen:
+            self._crawl_feed_seen.add(norm)
+            self.emit.crawl_feed("Found", source, url)
+        self._queue_url(url, depth, source)
+        return True
 
     @staticmethod
     def _collect_json_keys(obj) -> List[str]:
@@ -2302,13 +2483,13 @@ class Spider:
         for tag in soup.find_all(["a","link","area"], href=True):
             href = tag.get("href","").strip()
             if href and not href.startswith(("javascript:","mailto:","tel:","#")):
-                self._queue_url(urljoin(url, href), depth+1, "HTML_Link")
+                self._discover_url(urljoin(url, href), depth+1, "HTML_Link", show_feed=True)
         for tag in soup.find_all("script", src=True):
             src = tag.get("src","").strip()
             if src:
                 full = urljoin(url, src)
                 if self.is_valid(full):
-                    self._queue_url(full, depth+1, "HTML_Script")
+                    self._discover_url(full, depth+1, "HTML_Script", show_feed=True)
         for tag in soup.find_all("script"):
             if not tag.get("src") and tag.string:
                 Extractor.js_endpoints(tag.string, url, self.store, self.emit)
@@ -2346,26 +2527,95 @@ class Spider:
                 for _p in inputs:
                     if _p and _p not in _ep["params"]["form"]:
                         _ep["params"]["form"].append(_p)
-            self._queue_url(full, depth+1, "Form_Action")
+            self._discover_url(full, depth+1, "Form_Action", show_feed=True)
         for attr in ("data-src","data-href","data-url"):
             for tag in soup.find_all(attrs={attr: True}):
-                self._queue_url(urljoin(url, tag[attr]), depth+1, "DataAttr")
+                self._discover_url(urljoin(url, tag[attr]), depth+1, "DataAttr", show_feed=True)
         for tag in soup.find_all("script", type="application/ld+json"):
             if tag.string:
                 for m in re.finditer(r'"(?:url|@id|contentUrl|embedUrl)"\s*:\s*"([^"]+)"', tag.string):
-                    self._queue_url(m.group(1), depth+1, "JSONLD")
+                    self._discover_url(m.group(1), depth+1, "JSONLD", show_feed=True)
 
     async def _process_js(self, url, text, session):
+        ep_count = 0
+        param_count = 0
         Extractor.secrets(text, url, self.store, self.emit)
         Extractor.js_endpoints(text, url, self.store, self.emit)
         Extractor.js_params(text, url, self.store, self.emit)
         await self._check_sourcemap(session, url)
         for m in re.finditer(r'import\s*\(\s*["\']([^"\']+)["\']', text):
             full = urljoin(url, m.group(1))
-            if self.is_valid(full): self._queue_url(full, 1, "JS_DynImport")
+            if self.is_valid(full):
+                if self._discover_url(full, 1, "JS_DynImport", show_feed=True): ep_count += 1
         for m in re.finditer(r'["\']\/(?:static|_next|assets)\/[a-zA-Z0-9._\-\/]+\.js["\']', text):
             path = m.group(0).strip('"\'')
-            self._queue_url(urljoin(url, path), 1, "JS_Chunk")
+            if self._discover_url(urljoin(url, path), 1, "JS_Chunk", show_feed=True): ep_count += 1
+
+    async def _fetch_and_process(self, session, url, depth, source):
+        self.visited.add(normalize(url))
+        self._depth_cnt[depth] += 1
+        
+        s, hdrs, body = await fetch(session, 'GET', url, self.rl,
+                                    max_retries=self.cfg.max_retries,
+                                    base_delay=self.cfg.retry_base_delay)
+        
+        if s is None or body is None:
+            return
+        
+        # Record status early
+        self.store.record_status(url, 'GET', s)
+
+        # Feed line
+        ct = (hdrs.get('Content-Type', '') or hdrs.get('content-type', '')).lower()
+        is_js = 'javascript' in ct or url.split('?')[0].endswith('.js')
+        ftype = 'JS' if is_js else 'Crawl'
+        
+        self.emit.crawl_feed(ftype, 'GET', url, s, len(body))
+
+        if self.cfg.enable_extraction:
+            Extractor.extract_data(body, url, self.store, self.emit)
+
+        if s in (401, 403):
+            self.store.add_endpoint(url, source=source, score=Conf.MEDIUM, auth_required=True)
+            self.emit.warn(f'[Auth-wall:{s}] {url}')
+        elif s in (500, 501, 502, 503) and body:
+            import re
+            _ERR_RE = re.compile(r'(?:Traceback|Exception in thread|SyntaxError|ParseError|SQLSTATE|You have an error in your SQL|ORA-\d{5}|Fatal error:|Warning:|Uncaught \w+Error|at [a-zA-Z\.]+\([a-zA-Z]+\.java:\d+\))', re.I)
+            if _ERR_RE.search(body):
+                self.store.add_endpoint(url, source='Error_Leak', score=Conf.HIGH)
+                self.store.add_secret(body[:200], 'Error_Stack_Trace', url)
+                self.emit.warn(f'[Error-Leak] Verbose error at {url}')
+        elif s == 200:
+            if Extractor.is_soft_404(body, s):
+                self.emit.info(f'[Soft-404] Dropping non-existent route: {url}')
+                return
+
+            if depth <= 1:
+                self._detect_tech(hdrs, body, url)
+                Extractor.csp_hints(hdrs, url, self.store, self.emit)
+            
+            if 'text/html' in ct:
+                self.store.add_endpoint(url, source=f'HTML({source})', score=Conf.MEDIUM)
+                self._process_html(url, body, depth, source)
+            elif is_js:
+                self.store.add_endpoint(url, source='JS_File', score=Conf.LOW)
+                before = len(self.store.endpoints)
+                await self._process_js(url, body, session)
+                after = len(self.store.endpoints)
+                if after > before:
+                    self.emit.crawl_feed('JS', 'GET', url, extra=[f'├─ {after-before} endpoints extracted'])
+            elif 'json' in ct:
+                self.store.add_endpoint(url, source='JSON_Response', score=Conf.MEDIUM)
+                import re
+                for m in re.finditer(r'"([/][a-zA-Z0-9_\-\/]+)"', body):
+                    path = m.group(1)
+                    if len(path) > 3:
+                        full = urljoin(url, path)
+                        if self.is_valid(full):
+                            self.store.add_endpoint(full, source='JSON_Path', score=Conf.LOW)
+                            if not self._over_budget(depth + 1):
+                                self._discover_url(full, depth + 1, 'JSON_Path', show_feed=True)
+                self._extract_body_param_hints(url, body)
 
     async def _worker(self, session, worker_id, crawl_delay):
         while True:
@@ -2381,127 +2631,13 @@ class Spider:
                     if norm in self.visited or depth > self.cfg.max_depth or self._over_budget(depth):
                         pass
                     else:
-                        self.visited.add(norm)
-                        self._depth_cnt[depth] += 1
-                        self.emit.live_crawl(url)
-                        s, hdrs, body = await fetch(session, "GET", url, self.rl,
-                                                    max_retries=self.cfg.max_retries,
-                                                    base_delay=self.cfg.retry_base_delay)
-                        if s is not None and body is not None:
-                            # PASSIVE EXTRACTION (all response codes)
-                            if self.cfg.enable_extraction:
-                                Extractor.extract_data(body, url, self.store, self.emit)
-
-                            self.store.record_status(url, "GET", s)
-                            if s in (401, 403):
-                                self.store.add_endpoint(url, source=source,
-                                                        score=Conf.MEDIUM, auth_required=True)
-                                self.emit.warn(f"[Auth-wall:{s}] {url}")
-                            elif s in (500, 501, 502, 503) and body:
-                                # Error Leak: verbose stack traces or DB errors
-                                _ERR_RE = re.compile(
-                                    r'(?:Traceback|Exception in thread|SyntaxError|ParseError|'
-                                    r'SQLSTATE|You have an error in your SQL|ORA-\d{5}|'
-                                    r'Fatal error:|Warning:|Uncaught \w+Error|'
-                                    r'at [a-zA-Z\.]+\([a-zA-Z]+\.java:\d+\))',
-                                    re.I
-                                )
-                                if _ERR_RE.search(body):
-                                    self.store.add_endpoint(url, source="Error_Leak", score=Conf.HIGH)
-                                    self.store.add_secret(body[:200], "Error_Stack_Trace", url)
-                                    self.emit.warn(f"[Error-Leak] Verbose error at {url}")
-                            elif s == 200:
-                                if Extractor.is_soft_404(body, s):
-                                    self.emit.info(f"[Soft-404] Dropping non-existent route: {url}")
-                                    continue
-
-                                if depth <= 1:
-                                    self._detect_tech(hdrs, body, url)
-                                    Extractor.csp_hints(hdrs, url, self.store, self.emit)
-                                ct = (hdrs.get("Content-Type","") or hdrs.get("content-type","")).lower()
-                                if "text/html" in ct:
-                                    self.store.add_endpoint(url, source=f"HTML({source})", score=Conf.MEDIUM)
-                                    self._process_html(url, body, depth, source)
-                                    # Body param hints are not run on HTML — the name= pattern fires on
-                                    # every form input (csrf_token, submit, action…) creating noise.
-                                    # Param extraction from HTML is handled by _process_html() → form parser.
-                                elif "javascript" in ct or url.split("?")[0].endswith(".js"):
-                                    self.store.add_endpoint(url, source="JS_File", score=Conf.LOW)
-                                    await self._process_js(url, body, session)
-                                elif "json" in ct:
-                                    self.store.add_endpoint(url, source="JSON_Response", score=Conf.MEDIUM)
-                                    # -- Geo-location leak check
-                                    _GEO_RE = re.compile(
-                                        r'(?:"latitude"|"lat"|"lng"|"longitude"|"geo"|"coordinates")'
-                                        r'\s*:\s*(-?\d{1,3}\.\d+)',
-                                        re.I
-                                    )
-                                    # Only flag geo-coordinates when personal-data context is also
-                                    # present in the same response — bare pub coordinates (store
-                                    # locators, weather APIs) are not a privacy leak.
-                                    _GEO_PERSONAL_RE = re.compile(
-                                        r'"(?:user_?id|account_?id|member_?id|email|phone|'
-                                        r'mobile|ssn|national_?id|dob|date_?of_?birth|'
-                                        r'first_?name|last_?name|full_?name)"',
-                                        re.I
-                                    )
-                                    for _gm in _GEO_RE.finditer(body):
-                                        if _GEO_PERSONAL_RE.search(body):
-                                            self.store.add_secret(
-                                                f"GeoCoord: {_gm.group(0)[:60]}",
-                                                "GeoLocation_Leak", url)
-                                            self.emit.warn(f"[Geo-Leak] Coordinates + personal data exposed: {url}")
-                                        break  # one check per endpoint is enough
-                                    # ── path strings in JSON values ────────────────
-                                    for m in re.finditer(r'"([/][a-zA-Z0-9_\-\/]+)"', body):
-                                        path = m.group(1)
-                                        if len(path) > 3:
-                                            full = urljoin(url, path)
-                                            if self.is_valid(full):
-                                                self.store.add_endpoint(full, source="JSON_Path", score=Conf.LOW)
-                                                # Fix 6: queue for recursive crawl
-                                                if not self._over_budget(depth + 1):
-                                                    self._queue_url(full, depth + 1, "JSON_Path")
-                                    # Body hints (error messages / required-fields in JSON body)
-                                    self._extract_body_param_hints(url, body)
-                                    # ── Fix A+B: top-level JSON keys → runtime params ──
-                                    try:
-                                        _jdata = json.loads(body)
-                                        # top-level keys only (Fix B) — no recursion
-                                        _top_keys = self._collect_json_keys(_jdata)
-                                        # filter to high-risk base names (Fix A: strip before match)
-                                        _risk = [
-                                            k for k in _top_keys
-                                            if self._strip_param_suffix(k) in Store._RISK_PARAMS
-                                        ]
-                                        if _risk:
-                                            # add_runtime_params strips suffixes again before writing
-                                            # (idempotent — handles both raw and already-base names)
-                                            changed = self.store.add_runtime_params(url, "GET", _risk)
-                                            if changed:
-                                                _bases = self.store.endpoints[
-                                                    self.store._key(url, "GET")
-                                                ]["params"]["runtime"]
-                                                self.emit.info(f"[JSON-Params] {_bases} ← {url}")
-                                    except Exception:
-                                        pass
-                                elif "xml" in ct:
-                                    try:
-                                        root = ET.fromstring(body)
-                                        ns = {"sm":"http://www.sitemaps.org/schemas/sitemap/0.9"}
-                                        for loc in root.findall("sm:url/sm:loc", ns):
-                                            if loc.text: self._queue_url(loc.text, depth+1, "XML_Sitemap")
-                                    except Exception:
-                                        pass
-                                
-            except Exception:
-                pass
+                        await self._fetch_and_process(session, url, depth, source)
+            except Exception as e:
+                self.emit.warn(f"[Worker] Error processing {url}: {e}")
             finally:
                 if acquired:
                     self.queue.task_done()
-                if acquired:
-                    delay = crawl_delay if crawl_delay > 0 else random.uniform(
-                        self.cfg.jitter_min, self.cfg.jitter_max)
+                    delay = crawl_delay if crawl_delay > 0 else random.uniform(self.cfg.jitter_min, self.cfg.jitter_max)
                     await asyncio.sleep(delay)
 
     async def _probe_oidc(self, session, base):
@@ -2567,7 +2703,7 @@ class Spider:
                         if not Extractor.is_real_file(_ct, _t, None) or Extractor.is_soft_404(_t, _s):
                             continue
                         self.store.add_endpoint(_wk_url, source="WellKnown", score=Conf.LOW)
-                        self.emit.always_success(f"[.well-known] Found: {_wk_url}")
+                        self.emit.crawl_feed("Found", "GET", _wk_url)
                         if _wk.endswith("openid-configuration"):
                             await self._probe_oidc(session, self.target)
                         for _m in re.finditer(r'(?:^|\s)((?:https?://[^\s]+|/[a-zA-Z0-9_\-/]+))', _t, re.M):
