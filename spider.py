@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-  HELLHOUND SPIDER  v12.1  —  Standalone Recon Engine
+  HELLHOUND SPIDER  v12.3  —  Standalone Recon Engine
 
   Full SPA + Non-SPA Crawler | robots.txt | sitemap.xml | JS Analysis
 
@@ -927,7 +927,7 @@ class Store:
             "source": [], "confidence": 0, "confidence_label": "LOW",
             "auth_required": False, "parameter_sensitive": False,
             "observed_status": [], "baseline": None,
-            # v12.0 additions
+            # v12.3 additions
             "admin_panel":          False,
             "auth_classification":  [],
             "file_upload_candidate": False,
@@ -1163,7 +1163,7 @@ class Store:
             "openapi_exposed":     len(self.openapi),
             "sourcemaps_exposed":  len(self.sourcemaps),
             "tech_stack":          sorted(self.tech_stack),
-            # v12.0 additions
+            # v12.3 additions
             "admin_panels":       sum(1 for e in eps if e.get("admin_panel")),
             "auth_endpoints":     sum(1 for e in eps if e.get("auth_classification")),
             "upload_endpoints":   sum(1 for e in eps if e.get("file_upload_candidate")),
@@ -2293,7 +2293,7 @@ class SPAScanner:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# RECON UTILITIES (v12.0)
+# RECON UTILITIES (v12.3)
 # ══════════════════════════════════════════════════════════════════════
 
 def classify_admin_endpoints(store: Store):

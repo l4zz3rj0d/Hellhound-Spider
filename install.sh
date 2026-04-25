@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-#  Hellhound Spider — Installer (v12.0)
+#  Hellhound Spider — Installer (v12.3)
 #  Installs the `spider` command with an isolated virtual environment.
 # ─────────────────────────────────────────────────────────────────────
 
@@ -25,7 +25,7 @@ start_animation() {
     local label="$1"
     stop_animation
     
-    # Ultra-Wide Animator matching spider.py v12.0 spec
+    # Ultra-Wide Animator matching spider.py v12.3 spec
     python3 -c "
 import math, time, sys
 label = \"$label\"
