@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="hellhound-spider",
-    version="12.2",
+    version="12.3",
     description="Fast async web crawler for security testing",
     author="Sree Danush S",
     author_email="lazzer@gmail.com",
