@@ -2536,6 +2536,19 @@ class Spider:
                 for m in re.finditer(r'"(?:url|@id|contentUrl|embedUrl)"\s*:\s*"([^"]+)"', tag.string):
                     self._discover_url(m.group(1), depth+1, "JSONLD", show_feed=True)
 
+    async def _check_sourcemap(self, session, js_url):
+        """Check if a JS file has an exposed source map and record it."""
+        map_url = js_url + ".map"
+        try:
+            s, hdrs, body = await fetch(session, "GET", map_url, self.rl, max_retries=1)
+            if s == 200 and body:
+                ct = (hdrs or {}).get("content-type", "")
+                if "application/json" in ct or '"sources"' in body[:512]:
+                    self.store.add_sourcemap(map_url, js_url)
+                    self.emit.warn(f"[SourceMap] Exposed — {map_url}")
+        except Exception:
+            pass
+
     async def _process_js(self, url, text, session):
         ep_count = 0
         param_count = 0
