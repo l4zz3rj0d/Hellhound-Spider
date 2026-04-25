@@ -1324,7 +1324,9 @@ class Extractor:
             r'MongoError|SequelizeError|mysqli_error)',
             re.I), "DB_Error"),
         (re.compile(
-            r'\b(?!localhost\b)(?!127\.)[a-zA-Z0-9\-]+'
+            r'(?<![.a-zA-Z0-9_])'          # not a property chain (no this.internal, obj.corp)
+            r'(?!localhost\b)(?!127\.)'   # exclude localhost
+            r'[a-zA-Z0-9][a-zA-Z0-9\-]{3,}'  # hostname min 4 chars
             r'\.(internal|intranet|corp|lan|private)\b',
             re.I), "Internal_Host"),
     ]
@@ -1504,6 +1506,20 @@ class Extractor:
                     # Reject date-like patterns: YYYYMMDD, YYYYDDMM, DDMMYYYY etc
                     if re.match(r'(20[0-9]{2}[01][0-9][0-3][0-9]|[0-3][0-9][01][0-9]20[0-9]{2})', val): continue
 
+                if dtype == "Internal_Host":
+                    hostname = val.split('.')[0].lower()
+                    _JS_WORDS = {
+                        'this','self','that','base','root','data','type','keys','node',
+                        'dict','list','map','set','ctx','app','ext','lib','src',
+                        'dst','tmp','buf','str','num','val','key','idx','obj',
+                        'top','bot','mid','out','err','msg','log','res','req',
+                        'next','prev','curr','last','head','tail','body','path',
+                        'port','mode','flag','opts','args','props','state','proto',
+                    }
+                    if hostname in _JS_WORDS: continue
+                    # Reject camelCase identifiers (JS variable names, not hostnames)
+                    if re.search(r'[a-z][A-Z]', val.split('.')[0]): continue
+
                 if store.add_extracted_data(dtype, val, url):
                     counts[dtype] += 1
 
@@ -1551,6 +1567,17 @@ class Extractor:
                 val_lo = val.lower()
                 if any(ph in val_lo for ph in cls._SECRET_PLACEHOLDERS):
                     continue
+                # Bitcoin-specific post-filter
+                if stype == "Bitcoin_Address":
+                    # MD5/SHA hashes are all lowercase hex — real BTC has mixed case
+                    if not any(c.isupper() for c in val):
+                        continue
+                    # Binary/base64 artifacts have long repeated char runs
+                    if re.search(r'(.)(\1){3,}', val):
+                        continue
+                    # Must be 25-34 chars (P2PKH/P2SH only — not bech32)
+                    if not (25 <= len(val) <= 34):
+                        continue
                 if store.add_secret(val, stype, url):
                     emit.warn(f"[SECRET:{stype}] {val[:80]}")
 
@@ -2535,19 +2562,6 @@ class Spider:
             if tag.string:
                 for m in re.finditer(r'"(?:url|@id|contentUrl|embedUrl)"\s*:\s*"([^"]+)"', tag.string):
                     self._discover_url(m.group(1), depth+1, "JSONLD", show_feed=True)
-
-    async def _check_sourcemap(self, session, js_url):
-        """Check if a JS file has an exposed source map and record it."""
-        map_url = js_url + ".map"
-        try:
-            s, hdrs, body = await fetch(session, "GET", map_url, self.rl, max_retries=1)
-            if s == 200 and body:
-                ct = (hdrs or {}).get("content-type", "")
-                if "application/json" in ct or '"sources"' in body[:512]:
-                    self.store.add_sourcemap(map_url, js_url)
-                    self.emit.warn(f"[SourceMap] Exposed — {map_url}")
-        except Exception:
-            pass
 
     async def _process_js(self, url, text, session):
         ep_count = 0
