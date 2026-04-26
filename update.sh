@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-#  Hellhound Spider — Updater
+#  SPIDER — Updater
 #  Pulls the latest changes from Git and refreshes the installation.
 # ─────────────────────────────────────────────────────────────────────
 
 set -e
 
-RED='\033[91m'
-GRN='\033[92m'
-CYN='\033[96m'
-YLW='\033[93m'
-RST='\033[0m'
-BLD='\033[1m'
+RED="\033[91m"
+GRN="\033[92m"
+CYN="\033[96m"
+YLW="\033[93m"
+RST="\033[0m"
+BLD="\033[1m"
 
 info()    { echo -e "${CYN}[*]${RST} $1"; }
 success() { echo -e "${GRN}${BLD}[✓]${RST} $1"; }
@@ -25,7 +25,6 @@ start_animation() {
     local label="$1"
     stop_animation
     
-    # Ultra-Wide Animator matching spider.py v12.3 spec
     python3 -c "
 import math, time, sys
 label = \"$label\"
@@ -48,7 +47,6 @@ start = time.time()
 try:
     while True:
         t = time.time() - start
-        # Fixed width padding for labels (25 chars) to prevent jitter
         sys.stdout.write(f'\r  {wave(label, t):<35}  {braille(t)} ')
         sys.stdout.flush()
         time.sleep(0.06)
@@ -73,14 +71,13 @@ trap "stop_animation" EXIT INT TERM
 start_animation "VERIFYING SOURCE"
 if [ ! -d ".git" ]; then
     stop_animation
-    error "Not a git repository. Download the source via 'git clone' to use the updater."
+    error "Not a git repository. Download the source via \"git clone\" to use the updater."
 fi
 
 # ── Pull latest changes ───────────────────────────────────────────────────────
 stop_animation
 start_animation "FETCHING UPDATES"
 
-# Check for local changes and stash them to avoid pull conflicts
 LOCAL_CHANGES=$(git status --porcelain)
 if [ -n "$LOCAL_CHANGES" ]; then
     stop_animation
@@ -89,7 +86,6 @@ if [ -n "$LOCAL_CHANGES" ]; then
     start_animation "FETCHING UPDATES"
 fi
 
-# Determine current branch and pull
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
 stop_animation
 info "Fetching updates from branch: $CURRENT_BRANCH..."
@@ -101,20 +97,20 @@ else
     git pull || warn "Could not pull latest changes. You may have uncommitted conflicts."
 fi
 
-# Restore local changes if they were stashed
 if [ -n "$LOCAL_CHANGES" ]; then
-    stop_animation
     info "Restoring your local changes..."
-    git stash pop &>/dev/null || warn "Could not auto-apply local changes. Use 'git stash pop' manually."
+    git stash pop &>/dev/null || warn "Could not auto-apply local changes. Use \"git stash pop\" manually."
 fi
 
-# ── Run installer in non-interactive mode ─────────────────────────────────────
-stop_animation
+# ── Run installer ─────────────────────────────────────────────────────────────
+# IMPORTANT: Stop animation before calling installer to prevent duplicate text
+stop_animation 
 info "Synchronizing system configuration..."
 chmod +x install.sh
-./install.sh --yes
-success "Installation refreshed successfully"
+if [ -f "install.sh" ]; then
+    ./install.sh --yes || ./install.sh
+fi
 
 echo ""
-echo -e "  ${GRN}${BLD}Update complete.${RST} You are now on the latest version.\n"
+echo -e "  ${GRN}${BLD}Update complete.${RST} SPIDER is now on the latest version.\n"
 echo ""
