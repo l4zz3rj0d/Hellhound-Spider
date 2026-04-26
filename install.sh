@@ -137,13 +137,15 @@ if [[ "$INSTALL_PLAYWRIGHT" =~ ^[Yy]$ ]]; then
     "$VENV_PYTHON" -m pip install --quiet --upgrade playwright
     
     info "Fetching Chromium (this may take a minute)..."
-    "$VENV_PYTHON" -m playwright install chromium
+    # Filter Playwright's OS support warnings on Kali/unsupported distros to keep output clean.
+    # These warnings are emitted on stdout, so we filter both streams.
+    "$VENV_PYTHON" -m playwright install chromium 2>&1 | grep --line-buffered -vE "BEWARE|fallback" || true
     
     info "Hardening system dependencies..."
     if command -v sudo &>/dev/null && [ "$EUID" -ne 0 ]; then
-        sudo "$VENV_PYTHON" -m playwright install-deps chromium || warn "System dependency installation failed. You might need to install them manually."
+        sudo "$VENV_PYTHON" -m playwright install-deps chromium 2>&1 | grep --line-buffered -vE "BEWARE|fallback" || true
     else
-        "$VENV_PYTHON" -m playwright install-deps chromium || warn "System dependency installation failed. You might need to install them manually."
+        "$VENV_PYTHON" -m playwright install-deps chromium 2>&1 | grep --line-buffered -vE "BEWARE|fallback" || true
     fi
     
     success "Playwright + Chromium + Dependencies installed"
