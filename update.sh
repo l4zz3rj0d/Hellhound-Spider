@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-#  SPIDER — Updater
+#  SPIDER — Updater v2.0 (Cinematic)
 #  Pulls the latest changes from Git and refreshes the installation.
 # ─────────────────────────────────────────────────────────────────────
 
@@ -25,6 +25,7 @@ start_animation() {
     local label="$1"
     stop_animation
     
+    # Python-based Cinematic Animator (v2.0 - Flush-Hardened)
     python3 -c "
 import math, time, sys
 label = \"$label\"
@@ -39,7 +40,7 @@ def wave(label, t):
 def braille(t):
     chars = '⡀⡄⡆⡇⣇⣧⣷⣿'
     bar = ''
-    for i in range(50):
+    for i in range(40):
         idx = int((math.sin(t * 5 + i * 0.2) + 1) / 2 * (len(chars) - 1))
         bar += f'\033[91m{chars[idx]}\033[0m'
     return bar
@@ -47,18 +48,19 @@ start = time.time()
 try:
     while True:
         t = time.time() - start
-        sys.stdout.write(f'\r  {wave(label, t):<35}  {braille(t)} ')
+        sys.stdout.write(f'\r  {wave(label, t):<30} {braille(t)} ')
         sys.stdout.flush()
-        time.sleep(0.06)
-except KeyboardInterrupt:
+        time.sleep(0.05)
+except:
     pass
 " &
     ANIM_PID=$!
+    disown $ANIM_PID 2>/dev/null || true
 }
 
 stop_animation() {
     if [ "$ANIM_PID" -ne 0 ]; then
-        kill "$ANIM_PID" &>/dev/null || true
+        kill -9 "$ANIM_PID" &>/dev/null || true
         wait "$ANIM_PID" 2>/dev/null || true
         printf "\r\b\b\033[K"
         ANIM_PID=0
@@ -72,6 +74,14 @@ start_animation "VERIFYING SOURCE"
 if [ ! -d ".git" ]; then
     stop_animation
     error "Not a git repository. Download the source via \"git clone\" to use the updater."
+fi
+
+# ── Remote Sync (Ensure Org URL) ──────────────────────────────────────────────
+# Automatically update remote to point to the official organization
+REMOTE_URL=$(git remote get-url origin 2>/dev/null || echo "")
+if [[ "$REMOTE_URL" == *"l4zz3rj0d"* ]]; then
+    NEW_URL=$(echo "$REMOTE_URL" | sed "s/l4zz3rj0d/project-hellhound-org/g")
+    git remote set-url origin "$NEW_URL" &>/dev/null || true
 fi
 
 # ── Pull latest changes ───────────────────────────────────────────────────────
