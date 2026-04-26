@@ -22,7 +22,7 @@
 ### Linux / macOS
 
 ```bash
-git clone https://github.com/l4zz3rj0d/hellhound-spider.git
+git clone https://github.com/project-hellhound-org/hellhound-spider.git
 cd hellhound-spider
 chmod +x install.sh
 ./install.sh
@@ -37,7 +37,7 @@ spider https://target.com
 ### Windows
 
 ```bash
-git clone https://github.com/l4zz3rj0d/hellhound-spider.git
+git clone https://github.com/project-hellhound-org/hellhound-spider.git
 cd hellhound-spider
 pip install -e .                    # core install
 pip install -e ".[spa]"             # with Playwright SPA support
@@ -253,8 +253,8 @@ For authorized security testing only. This software is licensed under the **GNU 
 
 ## Author
 
-**Sree Danush S** (L4ZZ3RJ0D)
-
-[GitHub](https://github.com/l4zz3rj0d) · [Medium](https://medium.com/@l4zz3rj0d) · [TryHackMe](https://tryhackme.com/p/L4ZZ3RJ0D)
-
-> Integrated into the [Hellhound Pentest Framework](https://github.com/l4zz3rj0d/Hellhound-Pentest).
+<div align="center">
+  <a href="https://l4zz3rj0d.github.io">
+    <img src="https://img.shields.io/badge/Founder-L4ZZ3RJ0D-c0392b?style=for-the-badge" alt="L4ZZ3RJ0D"/>
+  </a>
+</div>
