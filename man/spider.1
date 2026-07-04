@@ -1,4 +1,4 @@
-.TH SPIDER 1 "2026-06-29" "Hellhound Spider v13.19" "User Commands"
+.TH SPIDER 1 "2026-07-04" "Hellhound Spider v13.21" "User Commands"
 .SH NAME
 spider \- SPA and non-SPA web crawler, endpoint discoverer, and attack-surface mapper
 .SH SYNOPSIS
@@ -158,6 +158,9 @@ same soft-404 and canary-fingerprint logic used for sensitive-file
 detection, so only meaningful hits are reported. Combine with
 \fB\-\-no\-crawl\fR for a discovery-only pass.
 .SS "CTF"
+.TP
+.BR \-\-ctf
+Enable CTF Mode. Automatically sets target flag matching templates to common defaults (e.g. flag{}, FLAG{}, etc. if not explicitly set via \fB\-K\fR), and enables active probing (\fB\-p\fR), sensitive files scanning (\fB\-e\fR), admin panel probing (\fB\-m\fR), GraphQL/OpenAPI schema discovery, and CORS audits with a higher default concurrency of 20.
 .TP
 .BR \-K ", " \-\-ctf\-flag " " \fITEMPLATE\fR
 Flag format template to scan for across all crawled content (HTML, JS,

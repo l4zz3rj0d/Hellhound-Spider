@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white"/>
-  <img src="https://img.shields.io/badge/version-13.19-red?style=flat-square"/>
+  <img src="https://img.shields.io/badge/version-13.21-red?style=flat-square"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square"/>
   <img src="https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square"/>
 </p>
@@ -60,6 +60,16 @@ playwright install chromium
 ./uninstall.sh           # Linux / macOS
 pip uninstall hellhound-spider   # Windows
 ```
+
+## v13.21 — CTF Mode & CORS Auditing
+
+v13.21 introduces a dedicated `--ctf` flag for CTF players, automated CORS vulnerability checks, and automated query parameter parsing.
+
+### New in v13.21
+
+- **CTF Mode** (`--ctf`) — Automatically enables sensitive file scanning, admin panel checks, OpenAPI/GraphQL discovery, CORS audits, flag extraction, high default concurrency, and highlights high-value parameters and backup files in summaries and reports.
+- **Active CORS Auditing** — Built-in active CORS audits to identify permissive configurations reflecting custom origin values.
+- **Parameter Extraction & Validation** — Automatically parses query parameters from crawled URLs and adds them to parameter maps.
 
 ---
 
@@ -173,6 +183,7 @@ spider <target> [options]
 
 | Flag | Short | Description |
 |---|---|---|
+| `--ctf` | | Enable CTF Mode: auto-enables sensitive files/admin probes, CORS auditing, default flag templates, high-value parameter tagging, and high concurrency. |
 | `--ctf-flag TEMPLATE` | `-K` | Flag format to scan for across all content (e.g. `HELLCORP{}`, `HTB{}`). Placeholder `{}` expands to flag body. Supports comma-separated templates. |
 
 ### Utilities

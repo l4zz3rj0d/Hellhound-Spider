@@ -60,7 +60,7 @@ except Exception:
           
                                                                         
 
-VERSION      = "13.19"
+VERSION      = "13.21"
 __author__   = "Sree Danush S (L4ZZ3RJ0D)"
 __license__  = "GPLv3"
 __credits__  = ["L4ZZ3RJ0D"]
@@ -521,9 +521,15 @@ class Emit:
                                                                          
         if self._nc:
             print(f"    {method:<7}  {conf_display:<12}  {_strip(auth)}{_strip(sens)}{_strip(snap)}  {url}{status_hint}")
+            ctf_hl = ep.get("ctf_highlights", [])
+            for h in ctf_hl:
+                print(f"       └─ [CTF] {h}")
         else:
             url_col = C.GR if is_404 else C.W
             print(f"  {mc}{method:<7}{C.RST} {cc}{conf_display:<12}{C.RST} {auth}{sens}{snap} {url_col}{url}{C.RST}{C.GR}{status_hint}{C.RST}")
+            ctf_hl = ep.get("ctf_highlights", [])
+            for h in ctf_hl:
+                print(f"      {C.R}└─{C.RST} {C.Y}[CTF] {h}{C.RST}")
 
     def print_always(self, msg: str):
         self._w(msg)
@@ -596,6 +602,19 @@ def print_results(intel: dict, target: str, elapsed: float,
         emit.row("Extracted",  str(s.get("extracted_data")),   icon="●", value_colour=C.G)
     if s.get("screenshots"):
         emit.row("Screenshots", str(s.get("screenshots")),      icon="●", value_colour=C.CY)
+
+    # Collect CTF Highlights
+    ctf_summaries = {}
+    for ep in eps:
+        for h in ep.get("ctf_highlights", []):
+            ctf_summaries[h] = ctf_summaries.get(h, 0) + 1
+    if ctf_summaries:
+        emit.section("CTF HIGHLIGHTS", orbital=True)
+        for h, count in sorted(ctf_summaries.items()):
+            if nc:
+                print(f"  [CTF] {h:<40} x{count}")
+            else:
+                print(f"  {C.R}◈{C.RST} {C.Y}{h:<40}{C.RST} {C.G}x{count}{C.RST}")
 
     if not nc:
         print(f"\n  {C.B}{C.W}PHASE LOGIC TIMELINE:{C.RST}")
@@ -1583,6 +1602,8 @@ class Config:
         self.follow_redirects   = kw.get("follow_redirects",   False)
         self.enable_subdomain_enum = kw.get("enable_subdomain_enum", False)
         self.wordlist           = kw.get("wordlist",           None)
+        self.wordlist_recursive = kw.get("wordlist_recursive", False)
+        self.wordlist_max_depth = kw.get("wordlist_max_depth", 2)
         self.no_crawl           = kw.get("no_crawl",           False)
         self.ctf_flag_templates = kw.get("ctf_flag_templates", [])
                                                                 
@@ -1934,7 +1955,14 @@ def cluster(url: str) -> str:
         path = "/".join(segs)
                                         
         qs_dict = parse_qs(p.query, keep_blank_values=True)
-        masked_qs = urlencode(sorted([(k, "") for k in qs_dict.keys()]), doseq=True)
+        masked_items = []
+        for k, vals in qs_dict.items():
+            for v in vals:
+                if _ID_RE.match(v):
+                    masked_items.append((k, ""))
+                else:
+                    masked_items.append((k, v))
+        masked_qs = urlencode(sorted(masked_items), doseq=True)
         return urlunparse(("", "", path, "", masked_qs, ""))
     except Exception:
         return url
@@ -2051,6 +2079,16 @@ class Store:
         ep = self.endpoints[key]
         if source not in ep["source"]:
             ep["source"].append(source)
+            
+        try:
+            _url_q = urlparse(url).query
+            if _url_q:
+                from urllib.parse import parse_qsl
+                for qk, _ in parse_qsl(_url_q):
+                    if qk and qk not in ep["params"]["query"]:
+                        ep["params"]["query"].append(qk)
+        except Exception:
+            pass
                                                                              
                                                                 
         try:
@@ -2605,6 +2643,7 @@ class Store:
                 "source": e["source"],
                 "admin_panel": e.get("admin_panel", False),
                 "auth_classification": e.get("auth_classification", []),
+                "ctf_highlights": e.get("ctf_highlights", []),
                 "file_upload_candidate": e.get("file_upload_candidate", False),
                 "screenshot": e.get("screenshot"),
                                                                                            
@@ -3975,6 +4014,30 @@ class IntelligentProber:
         self.session = session; self.store = store
         self.emit = emit; self.rl = rl; self.cfg = cfg
 
+    async def _check_cors(self, url):
+        target_origin = "http://evil-hound.com"
+        headers = {"Origin": target_origin}
+        s, h, _ = await fetch(self.session, "GET", url, self.rl, headers=headers)
+        if s and h:
+            acao = ""
+            acac = ""
+            for k, v in h.items():
+                k_low = k.lower()
+                if k_low == "access-control-allow-origin":
+                    acao = v.strip()
+                elif k_low == "access-control-allow-credentials":
+                    acac = v.strip().lower()
+            
+            reflected = False
+            if acao == target_origin or acao == "*":
+                reflected = True
+            
+            if reflected:
+                creds = (acac == "true")
+                self.store.add_cors(url, target_origin, acao, creds)
+                sev = "HIGH" if creds else "MEDIUM"
+                self.emit.warn(f"[CORS] {sev} vulnerability at {url} (Allow-Origin: {acao}, Credentials: {acac})")
+
     async def run(self):
         all_eps = self.store.all_endpoints()
         targets = [
@@ -4003,6 +4066,9 @@ class IntelligentProber:
             url           = ep["url"]
             known_methods = ep.get("methods", ["GET"])
             obs_status    = ep.get("observed_status", [])
+
+            if getattr(self.cfg, "enable_cors", False):
+                await self._check_cors(url)
 
             if not self.cfg.enable_method_disc:
                 continue
@@ -5670,6 +5736,44 @@ def classify_auth_endpoints(store: Store):
                 if label not in ep["auth_classification"]:
                     ep["auth_classification"].append(label)
 
+def classify_ctf_findings(store: Store):
+    ctf_params = {"file", "page", "path", "template", "tpl", "view", "src", "doc", "include", "read",
+                  "url", "ip", "host", "dest", "redirect", "link", "to", "target", "domain",
+                  "cmd", "command", "exec", "run", "execute", "eval", "ping", "name", "input"}
+    
+    backup_exts = {".bak", ".swp", ".backup", ".old", ".zip", ".tar.gz", ".tgz", ".sql", ".db", ".sqlite", ".env"}
+    
+    for ep in store.endpoints.values():
+        if not _is_confirmed(ep): continue
+        url = ep["url"]
+        parsed = urlparse(url)
+        
+        # Check parameters
+        params = ep.get("params", {})
+        all_params = []
+        if isinstance(params, dict):
+            for bucket in params.values():
+                for p in bucket:
+                    if p not in all_params:
+                        all_params.append(p)
+        else:
+            all_params = params
+        matched_params = [p for p in all_params if p.lower() in ctf_params]
+        if matched_params:
+            ep.setdefault("ctf_highlights", [])
+            h_str = f"High-Value Params: {', '.join(matched_params)}"
+            if h_str not in ep["ctf_highlights"]:
+                ep["ctf_highlights"].append(h_str)
+        
+        # Check files/extensions
+        path = parsed.path.lower()
+        for ext in backup_exts:
+            if path.endswith(ext) or f"{ext}." in path or path.endswith(ext + "~"):
+                ep.setdefault("ctf_highlights", [])
+                h_str = f"Exposed Backup/File: {ext}"
+                if h_str not in ep["ctf_highlights"]:
+                    ep["ctf_highlights"].append(h_str)
+
 def _flag_upload_endpoints(store: Store):
                                                                         
     _UPLOAD_PATH_RE = re.compile(
@@ -6475,10 +6579,25 @@ async def probe_sensitive_files(session, base: str, store, emit, rl):
     emit.always_info(f"[SensitiveFiles] Done — {found} sensitive file(s) found")
 
 
-async def probe_wordlist(session, base: str, store, emit, rl, wordlist_path: str):
+async def probe_wordlist(session, base: str, store, emit, rl, wordlist_path: str,
+                          recursive: bool = False, max_depth: int = 2,
+                          extra_seeds: Optional[List[str]] = None):
     """Directory/file brute force using a user-supplied wordlist.
-    Reuses canary fingerprinting + soft-404 filtering from the sensitive-file probe
-    so noisy SPA/wildcard-200 targets don't flood results with false positives."""
+
+    Unlike a naive implementation, this does NOT only ever brute-force the
+    scan root. It seeds from:
+      1. The scan root (always)
+      2. Any directory-shaped endpoint already discovered by the crawler
+         (e.g. if Spider found /assets via HTML/JS, it brute-forces
+         UNDER /assets too, instead of throwing that discovery away)
+      3. (if recursive=True) any directory-shaped HIT produced by an earlier
+         brute-force pass, feroxbuster/ffuf -recursive style, up to max_depth.
+
+    Reuses canary fingerprinting + soft-404 filtering from the sensitive-file
+    probe so noisy SPA/wildcard-200 targets don't flood results with false
+    positives. A fresh canary is computed per seed directory since soft-404
+    behavior can differ between path prefixes (e.g. /api/* vs static dirs).
+    """
     try:
         with open(wordlist_path, "r", encoding="utf-8", errors="ignore") as f:
             words = [w.strip() for w in f if w.strip() and not w.startswith("#")]
@@ -6490,58 +6609,117 @@ async def probe_wordlist(session, base: str, store, emit, rl, wordlist_path: str
         emit.warn(f"[Wordlist] {wordlist_path} is empty")
         return
 
-    emit.always_info(f"[Wordlist] Brute-forcing {len(words)} path(s) from {wordlist_path}…")
+    # Build the initial seed-directory queue. Seeds are normalized to have
+    # no trailing slash so `seed + "/" + word` always produces a clean path.
+    seen_seeds: set = set()
+    seed_queue: list = []
 
-    canary_slug  = hashlib.md5(f"{base}-canary-{random.random()}".encode()).hexdigest()[:16]
-    canary_url   = base.rstrip("/") + f"/{canary_slug}-nonexistent-wl"
-    canary_s, canary_hdrs, canary_body = await fetch(session, "GET", canary_url, rl)
-    canary_hash  = None
-    canary_len   = 0
-    canary_is_html = False
-    if canary_body and canary_s in (200, 206):
-        canary_hash    = hashlib.md5(canary_body.encode(errors="ignore")).hexdigest()
-        canary_len     = len(canary_body)
-        canary_ct      = ((canary_hdrs or {}).get("content-type", "") or "").lower()
-        canary_is_html = "text/html" in canary_ct
-        emit.info(f"[Wordlist] Soft-404 canary fingerprint: {canary_hash[:12]}… "
-                  f"(status={canary_s}, len={canary_len}, html={canary_is_html})")
+    def _queue_seed(seed_base: str, depth: int):
+        norm = seed_base.rstrip("/")
+        if norm in seen_seeds:
+            return
+        seen_seeds.add(norm)
+        seed_queue.append((norm, depth))
 
-    found = 0
+    _queue_seed(base, 0)
+    for s in (extra_seeds or []):
+        _queue_seed(s, 0)
+
+    total_found = 0
+    total_words_run = 0
     sem = asyncio.Semaphore(20)
 
-    async def _probe_word(word):
-        nonlocal found
-        path = word if word.startswith("/") else "/" + word
-        url = base.rstrip("/") + path
-        async with sem:
-            s, hdrs, body = await fetch(session, "GET", url, rl)
-        if s in (404,):
-            return
-        if s in (401, 403) and not body:
-            # Forbidden/unauthorized is still a real finding (path exists, blocked)
-            store.add_endpoint(url, source="Wordlist_Probe", score=Conf.LOW)
-            emit.info(f"[Wordlist] {s} (access-controlled) -> {url}")
-            found += 1
-            return
-        if s not in (200, 201, 204, 206, 301, 302, 307, 308):
-            return
-        if body:
-            if canary_hash:
-                probe_hash = hashlib.md5(body.encode(errors="ignore")).hexdigest()
-                if probe_hash == canary_hash:
-                    return
-            ct = ((hdrs or {}).get("content-type", "") or "").lower()
-            if canary_is_html and canary_len > 200 and "text/html" in ct:
-                if canary_len > 0 and abs(len(body) - canary_len) / canary_len < 0.03:
-                    return
-            if Extractor.is_soft_404(body, s):
-                return
-        store.add_endpoint(url, source="Wordlist_Probe", score=Conf.HIGH)
-        emit.warn_sev(f"[Wordlist] {s} -> {url}", "MEDIUM")
-        found += 1
+    # Heuristics for "this hit looks like a directory, worth recursing into":
+    #  - trailing slash on final URL (post-redirect)
+    #  - no '.' in the last path segment (no file extension)
+    #  - status was a redirect TO the same path + '/'
+    def _looks_like_dir(url: str, status: int, final_loc: str = "") -> bool:
+        path = urlparse(url).path
+        last_seg = path.rstrip("/").rsplit("/", 1)[-1]
+        if "." in last_seg:
+            return False
+        if status in (301, 302, 307, 308) and final_loc:
+            return final_loc.rstrip("/") == url.rstrip("/") + "" or final_loc.endswith("/")
+        return True
 
-    await asyncio.gather(*(_probe_word(w) for w in words))
-    emit.always_info(f"[Wordlist] Done — {found} hit(s) found from {len(words)} path(s)")
+    emit.always_info(
+        f"[Wordlist] Brute-forcing {len(words)} path(s) from {wordlist_path} "
+        f"({'recursive, max_depth=' + str(max_depth) if recursive else 'single-pass'})…"
+    )
+
+    while seed_queue:
+        seed_base, depth = seed_queue.pop(0)
+
+        # Per-seed soft-404 canary — different directories can have different
+        # catch-all/SPA-fallback behavior, so don't reuse the root's canary.
+        canary_slug = hashlib.md5(f"{seed_base}-canary-{random.random()}".encode()).hexdigest()[:16]
+        canary_url  = seed_base + f"/{canary_slug}-nonexistent-wl"
+        canary_s, canary_hdrs, canary_body = await fetch(session, "GET", canary_url, rl)
+        canary_hash    = None
+        canary_len     = 0
+        canary_is_html = False
+        if canary_body and canary_s in (200, 206):
+            canary_hash    = hashlib.md5(canary_body.encode(errors="ignore")).hexdigest()
+            canary_len     = len(canary_body)
+            canary_ct      = ((canary_hdrs or {}).get("content-type", "") or "").lower()
+            canary_is_html = "text/html" in canary_ct
+
+        emit.info(f"[Wordlist] Seed: {seed_base}/  (depth={depth}, "
+                  f"canary={'set' if canary_hash else 'none'})")
+
+        found_here = 0
+        new_dir_hits: list = []
+
+        async def _probe_word(word):
+            nonlocal found_here
+            path = word if word.startswith("/") else "/" + word
+            url = seed_base + path
+            async with sem:
+                s, hdrs, body = await fetch(session, "GET", url, rl)
+            if s in (404,):
+                return
+            if s in (401, 403) and not body:
+                # Forbidden/unauthorized is still a real finding (path exists, blocked)
+                store.add_endpoint(url, source="Wordlist_Probe", score=Conf.LOW)
+                emit.info(f"[Wordlist] {s} (access-controlled) -> {url}")
+                found_here += 1
+                return
+            if s not in (200, 201, 204, 206, 301, 302, 307, 308):
+                return
+            loc = (hdrs or {}).get("location", "") or (hdrs or {}).get("Location", "")
+            if body:
+                if canary_hash:
+                    probe_hash = hashlib.md5(body.encode(errors="ignore")).hexdigest()
+                    if probe_hash == canary_hash:
+                        return
+                ct = ((hdrs or {}).get("content-type", "") or "").lower()
+                if canary_is_html and canary_len > 200 and "text/html" in ct:
+                    if canary_len > 0 and abs(len(body) - canary_len) / canary_len < 0.03:
+                        return
+                if Extractor.is_soft_404(body, s):
+                    return
+            store.add_endpoint(url, source="Wordlist_Probe", score=Conf.HIGH)
+            emit.warn_sev(f"[Wordlist] {s} -> {url}", "MEDIUM")
+            found_here += 1
+            if recursive and depth < max_depth and _looks_like_dir(url, s, loc):
+                new_dir_hits.append(url)
+
+        await asyncio.gather(*(_probe_word(w) for w in words))
+        total_found += found_here
+        total_words_run += len(words)
+
+        for hit_url in new_dir_hits:
+            _queue_seed(hit_url, depth + 1)
+
+        if new_dir_hits:
+            emit.info(f"[Wordlist] {len(new_dir_hits)} dir-shaped hit(s) under "
+                      f"{seed_base}/ queued for recursive brute-force")
+
+    emit.always_info(
+        f"[Wordlist] Done — {total_found} hit(s) found across {len(seen_seeds)} "
+        f"director{'y' if len(seen_seeds)==1 else 'ies'} "
+        f"({total_words_run} total request(s))"
+    )
 
 
                                                                         
@@ -7351,6 +7529,32 @@ class Spider:
             href = tag.get("href","").strip()
             if href and not href.startswith(("javascript:","mailto:","tel:","#")):
                 self._discover_url(urljoin(url, href), depth+1, "HTML_Link", show_feed=True)
+
+        # Extract potential endpoints/URLs from plain text nodes (e.g. code, pre, paragraphs, divs)
+        for el in soup.find_all(string=True):
+            if el.parent.name in ("script", "style"):
+                continue
+            if isinstance(el, Comment):
+                continue
+            
+            txt = el.strip()
+            if not txt or len(txt) < 3:
+                continue
+            
+            # Find relative paths starting with /
+            for m in re.finditer(r'(?:^|\s|["\'`>])(/[a-zA-Z0-9_\-\.\/]+(?:\?[a-zA-Z0-9_\-.*%+=&;:/]*)?)(?:$|\s|["\'`<])', txt):
+                path = m.group(1).strip()
+                if len(path) < 3 or path.startswith("//"):
+                    continue
+                full = urljoin(url, path)
+                if self.is_valid(full):
+                    self._discover_url(full, depth + 1, "HTML_Text_Path", show_feed=True)
+            
+            # Find absolute URLs
+            for m in re.finditer(r'(https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=]+)', txt):
+                candidate = m.group(1).rstrip(".,)")
+                if self.is_valid(candidate):
+                    self._discover_url(candidate, depth + 1, "HTML_Text_URL", show_feed=True)
         for tag in soup.find_all("script", src=True):
             src = tag.get("src","").strip()
             if src:
@@ -7983,7 +8187,37 @@ class Spider:
 
                 if self.cfg.wordlist:
                     self.emit.animator.update(0, "Recon Wordlist Brute Force")
-                    await probe_wordlist(session, self.target, self.store, self.emit, self.rl, self.cfg.wordlist)
+                    # Don't just brute-force the scan root — also seed from
+                    # directory-shaped endpoints the crawler already found
+                    # (e.g. /assets discovered via HTML/JS) instead of
+                    # discarding that discovery in favor of a fresh root scan.
+                    _seen_dirs = set()
+                    _dir_seeds = []
+                    for ep in self.store.endpoints.values():
+                        ep_path = urlparse(ep["url"]).path.rstrip("/")
+                        if not ep_path or ep_path == "":
+                            continue
+                        last_seg = ep_path.rsplit("/", 1)[-1]
+                        # Skip files (has an extension) and template placeholders
+                        if "." in last_seg or "{param}" in ep_path:
+                            continue
+                        seed_url = self.target.rstrip("/") + ep_path
+                        if seed_url not in _seen_dirs:
+                            _seen_dirs.add(seed_url)
+                            _dir_seeds.append(seed_url)
+                    if _dir_seeds:
+                        self.emit.info(
+                            f"[Wordlist] Seeding from {len(_dir_seeds)} discovered "
+                            f"directory-shaped endpoint(s): {', '.join(_dir_seeds[:5])}"
+                            + ("…" if len(_dir_seeds) > 5 else "")
+                        )
+                    await probe_wordlist(
+                        session, self.target, self.store, self.emit, self.rl,
+                        self.cfg.wordlist,
+                        recursive=self.cfg.wordlist_recursive,
+                        max_depth=self.cfg.wordlist_max_depth,
+                        extra_seeds=_dir_seeds,
+                    )
 
                 if not self.is_ip_target and self.cfg.enable_wayback:
                     self.emit.animator.update(0, "Recon Wayback")
@@ -8110,6 +8344,7 @@ class Spider:
                 classify_legacy_endpoints(self.store)
                 classify_admin_endpoints(self.store)
                 classify_auth_endpoints(self.store)
+                classify_ctf_findings(self.store)
                 _flag_upload_endpoints(self.store)
                                                               
                 self.emit.animator.start_anim("ASM: JS SCA Analysis")
@@ -8477,12 +8712,20 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Comma-separated extra hosts to include in scope  e.g. api.target.com,cdn.target.com")
     scope.add_argument("--wordlist", "-w", type=str, default=None, metavar="FILE",
                        help="Path to a directory/file wordlist for endpoint discovery")
+    scope.add_argument("--wordlist-recursive", "-wr", action="store_true", default=False,
+                       help="Recurse into directory-shaped wordlist hits (feroxbuster/ffuf -recursive "
+                            "style). Also auto-seeds from directory-shaped endpoints already "
+                            "discovered by the crawler, instead of only brute-forcing the scan root.")
+    scope.add_argument("--wordlist-depth", type=int, default=2, metavar="N",
+                       help="Max recursion depth when --wordlist-recursive is set (default: 2)")
 
     ctf = p.add_argument_group(f"{C.CY}CTF{C.RST}")
     ctf.add_argument("--ctf-flag", "-K", type=str, default=None, metavar="TEMPLATE",
                      help="Flag format to scan for across all content (HTML, JS, CSS, JSON, "
                           "error pages, comments). Use {} as the flag-body placeholder. "
                           "Multiple formats comma-separated: flag{},ctf{}")
+    ctf.add_argument("--ctf", action="store_true",
+                     help="Enable CTF Mode: auto-enables sensitive-files/admin probes, CORS auditing, default flag templates (FLAG{} and flag{}), and high concurrency")
 
     util = p.add_argument_group(f"{C.CY}Utilities{C.RST}")
     util.add_argument("--diff",    "-D", type=str, default=None, metavar="OLD_REPORT",
@@ -8552,7 +8795,19 @@ def main():
     _pf("Screenshots",
         f"enabled ({args.screenshot or 'standard'})" if args.screenshot else "disabled",
         C.G if args.screenshot else C.GR)
-    print()
+    if getattr(args, "ctf", False):
+        if args.concurrency == 12:
+            args.concurrency = 20
+        if args.timeout == 15:
+            args.timeout = 5
+        args.admin_probe = True
+        args.sensitive_probe = True
+        args.probe = True
+        args.no_graphql = False
+        args.no_openapi = False
+        args.no_cors = False
+        if not args.ctf_flag:
+            args.ctf_flag = "FLAG{},flag{}"
 
     cookies = SessionManager.parse_cookies(args.cookie)
     xhdrs   = SessionManager.parse_auth_header(args.auth or "")
@@ -8612,6 +8867,8 @@ def main():
         follow_redirects  = args.follow_redirects,
         enable_subdomain_enum = args.subdomains,
         wordlist          = args.wordlist,
+        wordlist_recursive = args.wordlist_recursive,
+        wordlist_max_depth = args.wordlist_depth,
         no_crawl          = args.no_crawl,
         ctf_flag_templates = [t.strip() for t in args.ctf_flag.split(",") if t.strip()]
                              if args.ctf_flag else [],
