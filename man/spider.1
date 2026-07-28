@@ -106,6 +106,12 @@ Enable SPA form filling and button clicking during headless browser
 scanning. Only use against targets you are authorized to test, as this
 performs active interactions with the application.
 .TP
+.BR \-J ", " \-\-deep\-spa
+After crawling, revisit every discovered page in a real browser to capture
+background XHR/fetch API calls (the "Network tab" view). Best for smaller targets
+with few sub-applications or lab instances — captures dynamic API endpoints
+that only fire when page JS executes.
+.TP
 .BR \-R ", " \-\-no\-cors
 Disable CORS misconfiguration checks.
 .TP

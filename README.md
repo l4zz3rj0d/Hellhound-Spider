@@ -159,7 +159,9 @@ spider <target> [options]
 | `--admin-probe` | `-m` | Probe common admin/management panel paths |
 | `--sensitive-probe` | `-e` | Probe known sensitive file paths |
 | `--wayback` | `-y` | Query the Wayback Machine for archived URLs |
+| `--deep-spa` | `-J` | Revisit all discovered pages in headless Chromium to capture dynamic background XHR/fetch API calls per page and extract response PII |
 | `--spa-interact` | `-I` | Enable SPA form filling and button clicking |
+
 | `--no-cors` | `-R` | Skip CORS misconfiguration checks |
 | `--no-graphql` | `-G` | Skip GraphQL introspection probe |
 | `--no-openapi` | `-O` | Skip OpenAPI / Swagger discovery |
@@ -236,6 +238,10 @@ spider https://target.com -D previous.json
 
 # SPA with form interaction enabled
 spider https://target.com -I -v
+
+# Deep SPA crawl — map background API endpoints per page & extract response leaks
+spider https://target.com -J -x
+
 
 # Disable noise filter to see everything (including CDN/repo paths)
 spider https://target.com -F

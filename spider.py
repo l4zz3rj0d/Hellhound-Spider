@@ -1156,8 +1156,27 @@ def print_results(intel: dict, target: str, elapsed: float,
                 )
                 emit.leader_row("PARAMS", param_str)
 
-                                                                   
+    page_bg = intel.get("spa_background_requests", {})
+    if page_bg:
+        total_bg_reqs = sum(len(reqs) for reqs in page_bg.values())
+        emit.section(f"SPA BACKGROUND API TREE  ({total_bg_reqs} background request(s) across {len(page_bg)} page(s))", orbital=True)
+        for page_url, bg_reqs in page_bg.items():
+            if nc:
+                print(f"  ● Page: {page_url}")
+                for req in bg_reqs:
+                    print(f"    ├─ {req.get('method','GET')} {req.get('url','')}")
+            else:
+                print(f"  {C.CY}● Page:{C.RST} {C.W}{page_url}{C.RST}")
+                for i, req in enumerate(bg_reqs):
+                    is_last = (i == len(bg_reqs) - 1)
+                    branch  = "└──" if is_last else "├──"
+                    m = req.get("method", "GET")
+                    mc = { "GET": C.GD, "POST": C.Y, "PUT": C.O, "DELETE": C.R }.get(m, C.GL)
+                    u  = req.get("url", "")
+                    print(f"    {C.GR}{branch}{C.RST} {mc}{m:<6}{C.RST} {C.W}{u}{C.RST}")
+
     orphans = intel.get("js_orphan_params", [])
+
     if orphans:
         total_orphan = sum(len(o["params"]) for o in orphans)
         emit.section(f"JS ORPHAN PARAMS  ({total_orphan} unattributed params, {len(orphans)} files)", orbital=True)
@@ -1576,6 +1595,7 @@ class Config:
         self.verbose            = kw.get("verbose",            False)
         self.use_playwright     = kw.get("use_playwright",     True)
         self.enable_spa_interact = kw.get("enable_spa_interact", False)
+        self.enable_deep_spa     = kw.get("enable_deep_spa",     False)
         self.enable_extraction   = kw.get("enable_extraction",   False)
         self.enable_screenshots  = kw.get("enable_screenshots",  False)
         self.screenshot_priority = kw.get("screenshot_priority", "standard")
@@ -1881,7 +1901,9 @@ _AUTH_EXCLUDE_RE = re.compile(r'/author(?:s)?/', re.I)
                                                                       
                                                         
                                                       
-_NOISE_PATH_RE = re.compile(
+# VCS-specific multi-segment patterns — safe to match anywhere in any path
+# because their structure (e.g. /blob/<ref>/, /tree/<ref>/) is unambiguous.
+_NOISE_PATH_VCS_RE = re.compile(
     r'/(?:'
     r'blob/[^/]+/'                                                   
     r'|tree/[^/]+/'                                                   
@@ -1889,7 +1911,18 @@ _NOISE_PATH_RE = re.compile(
     r'|releases/tag/'                                                  
     r'|graphs/'                                                  
     r'|compare/'                                                 
-    r'|branches'                                                    
+    r')',
+    re.I
+)
+
+# Generic single-word GitHub/GitLab tab names — these are common words
+# (pulse, actions, forks, activity …) that are also legitimate application
+# route names on non-VCS targets.  Only suppress them when they appear at
+# VCS-like path depth (≥ 3 segments, e.g. /owner/repo/pulse) so that
+# top-level routes like /pulse are never silently dropped.
+_NOISE_PATH_TABS_RE = re.compile(
+    r'(?:/[^/]+){2,}/(?:'
+    r'branches'                                                    
     r'|stargazers'                                                
     r'|watchers'                                                     
     r'|forks'                                                     
@@ -1897,9 +1930,13 @@ _NOISE_PATH_RE = re.compile(
     r'|actions'                                                  
     r'|activity'                                                   
     r'|custom-properties'                                            
-    r')',
+    r')(?:/|$)',
     re.I
 )
+
+def _is_noise_path(path: str) -> bool:
+    """Return True if *path* looks like VCS browser UI noise."""
+    return bool(_NOISE_PATH_VCS_RE.search(path) or _NOISE_PATH_TABS_RE.search(path))
 
                                                                         
                                                                      
@@ -2020,6 +2057,22 @@ class Store:
         self.sensitive_files:    List[dict] = []
         self.js_libs:            List[dict] = []
         self.cloud_probes:       List[dict] = []
+        self.page_bg_requests:   Dict[str, List[dict]] = defaultdict(list)
+        self._bg_req_seen:       Set[tuple] = set()
+
+    def record_bg_request(self, page_url: str, bg_url: str, method: str = "GET", source: str = "DeepSPA"):
+        if not page_url or not bg_url:
+            return
+        key = (page_url, bg_url, method.upper())
+        if key not in self._bg_req_seen:
+            self._bg_req_seen.add(key)
+            self.page_bg_requests[page_url].append({
+                "url": bg_url,
+                "method": method.upper(),
+                "source": source,
+            })
+            self.add_graph_edge(page_url, bg_url, via=source, depth=1)
+
 
     def _key(self, url, method):
         return f"{method.upper()}:{cluster(normalize(url))}"
@@ -2693,6 +2746,8 @@ class Store:
             "sensitive_files":   self.sensitive_files,
             "js_libs":           self.js_libs,
             "cloud_probes":      self.cloud_probes,
+            "spa_background_requests": dict(self.page_bg_requests),
+
                                                                              
                                                                                
                                                       
@@ -5447,6 +5502,297 @@ class SPAScanner:
         await self._pw.stop()
 
 
+class DeepSPACrawler:
+    """Multi-page SPA crawler — navigates Playwright to every discovered
+    HTML page and intercepts background XHR/fetch requests that only fire
+    when the page's JavaScript actually executes in a browser.
+    """
+
+    def __init__(self, target_url, store, emit, cookies, extra_headers, is_valid_fn):
+        self.target_url = target_url
+        self.store = store
+        self.emit = emit
+        self.cookies = cookies
+        self.extra_headers = extra_headers
+        self.is_valid = is_valid_fn
+        self._found = 0
+        self._pages_visited = 0
+
+    async def run(self):
+        """Launch Playwright browser and visit every discovered HTML page."""
+        if not PLAYWRIGHT_AVAILABLE:
+            self.emit.warn("[DeepSPA] Playwright not installed — skipping")
+            return
+
+        html_pages = set()
+        for ep in self.store.all_endpoints():
+            url = ep.get("url", "")
+            if not url or not self.is_valid(url):
+                continue
+            observed = ep.get("observed_status", [])
+            sources  = ep.get("source", [])
+            has_html_source = any(
+                "HTML" in s or "SPA_DOM" in s or "Seed" in s or "Redirect" in s
+                for s in sources
+            )
+            is_api = bool(re.search(r'/api/|/v\d+/|\.json$|\.js$|\.xml$', url, re.I))
+            if is_api:
+                continue
+            if has_html_source or 200 in observed:
+                html_pages.add(url)
+
+        html_pages.add(self.target_url.rstrip("/"))
+        html_pages.add(self.target_url.rstrip("/") + "/")
+
+        if not html_pages:
+            self.emit.always_info("[DeepSPA] No HTML pages discovered — skipping")
+            return
+
+        pages = sorted(html_pages, key=lambda u: (len(urlparse(u).path), u))
+        self.emit.always_info(
+            f"[DeepSPA] Launching headless browser — {len(pages)} page(s) to visit")
+
+        try:
+            pw = await async_playwright().start()
+            browser = await pw.chromium.launch(headless=True, args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+            ])
+
+            ctx_args = {
+                "ignore_https_errors": True,
+                "viewport": {"width": 1366, "height": 768},
+            }
+            ua = self.extra_headers.get("User-Agent")
+            if ua:
+                ctx_args["user_agent"] = ua
+            context = await browser.new_context(**ctx_args)
+
+            if self.cookies:
+                domain = urlparse(self.target_url).hostname or ""
+                for name, value in self.cookies.items():
+                    await context.add_cookies([{
+                        "name": name, "value": value,
+                        "domain": domain, "path": "/",
+                    }])
+
+            await context.route(
+                re.compile(r'\.(png|jpg|jpeg|gif|svg|ico|woff2?|ttf|css|mp4|mp3)(\?.*)?$'),
+                lambda route, _: asyncio.create_task(route.abort())
+            )
+
+            try:
+                from playwright_stealth import stealth_async
+                _stealth_fn = stealth_async
+            except ImportError:
+                _stealth_fn = None
+
+            page = await context.new_page()
+            if _stealth_fn:
+                try:
+                    await _stealth_fn(page)
+                except Exception:
+                    pass
+
+            _seen_xhr = set()
+
+            async def _on_request(req):
+                url = req.url
+                rtype = req.resource_type
+                method = req.method or "GET"
+                if rtype not in ("fetch", "xhr"):
+                    return
+                dedup_key = (method, url.split("?")[0])
+                is_new = dedup_key not in _seen_xhr
+                _seen_xhr.add(dedup_key)
+
+                hdrs = dict(req.headers or {})
+                auth = any(
+                    h.lower() in ("authorization", "x-auth-token", "x-api-key")
+                    for h in hdrs
+                )
+                self.store.add_endpoint(
+                    url, method=method, source="DeepSPA_XHR",
+                    score=Conf.CONFIRMED, auth_required=auth
+                )
+                if self.store.merge_headers(url, method, hdrs):
+                    self.emit.info(f"[DeepSPA-Headers] captured for {url}")
+
+                if method == "POST":
+                    try:
+                        post_data = req.post_data
+                        if post_data:
+                            try:
+                                body_obj = json.loads(post_data)
+                                if isinstance(body_obj, dict):
+                                    self.store.add_endpoint(
+                                        url, method="POST",
+                                        source="DeepSPA_XHR_POST",
+                                        params=list(body_obj.keys()),
+                                        score=Conf.CONFIRMED,
+                                        auth_required=auth,
+                                    )
+                            except Exception:
+                                parsed_body = parse_qs(post_data)
+                                if parsed_body:
+                                    self.store.add_endpoint(
+                                        url, method="POST",
+                                        source="DeepSPA_XHR_POST",
+                                        params=list(parsed_body.keys()),
+                                        score=Conf.CONFIRMED,
+                                        auth_required=auth,
+                                    )
+                    except Exception:
+                        pass
+
+                if is_new:
+                    self._found += 1
+                    self.emit.success(f"[DeepSPA-XHR] {method} {url}")
+                
+                if hasattr(self, "_current_page_url") and self._current_page_url:
+                    self.store.record_bg_request(self._current_page_url, url, method=method, source="DeepSPA_XHR")
+
+            async def _on_response(resp):
+                try:
+                    r_url = resp.url
+                    r_method = resp.request.method or "GET"
+                    r_rtype = resp.request.resource_type
+                    if r_rtype not in ("fetch", "xhr"):
+                        return
+                    if resp.status not in range(200, 210):
+                        return
+                    ct = (resp.headers.get("content-type") or "").lower()
+                    if "json" not in ct:
+                        return
+                    body = await resp.text()
+                    if not body or len(body) > 512_000:
+                        return
+
+                    # 1. Mine nested ID / key fields
+                    try:
+                        obj = json.loads(body)
+                        def _mine_resp(o, depth=0):
+                            if depth > 3 or not isinstance(o, dict):
+                                return
+                            for k, v in o.items():
+                                if re.match(
+                                    r'^(?:id|uid|user_?id|order_?id|basket_?id|'
+                                    r'item_?id|product_?id|address_?id|card_?id|'
+                                    r'patient_?id|staff_?id|account_?id|tenant_?id|'
+                                    r'token|session_?id|api_?key|secret)$',
+                                    str(k), re.I
+                                ):
+                                    vstr = str(v) if v is not None else ""
+                                    if vstr and len(vstr) < 256:
+                                        r_key = self.store._key(r_url, r_method)
+                                        if r_key in self.store.endpoints:
+                                            ep = self.store.endpoints[r_key]
+                                            obs = ep["observed_values"].setdefault(k, [])
+                                            if vstr not in obs:
+                                                obs.append(vstr)
+                                                self.emit.warn(
+                                                    f"[DeepSPA-ResponseID] {k}={vstr} ← {r_url}")
+                                if isinstance(v, (dict, list)):
+                                    _mine_resp(v, depth + 1)
+
+                        if isinstance(obj, list):
+                            for item in obj[:10]:
+                                _mine_resp(item)
+                        else:
+                            _mine_resp(obj)
+                    except Exception:
+                        pass
+
+                    # 2. Mine API paths leaking inside JSON response strings
+                    for sub_path in re.findall(r'["\'](/(?:[a-zA-Z0-9_\-]+/){1,5}[a-zA-Z0-9_\-]+)["\']', body):
+                        full_ep = urljoin(r_url, sub_path)
+                        if self.is_valid(full_ep):
+                            self.store.add_endpoint(full_ep, source="DeepSPA_JSON_Leak", score=Conf.CONFIRMED)
+
+                    # 3. Mine credentials, tokens & secrets leaking inside JSON response
+                    for pattern, label in Extractor._SECRET_RE:
+                        for match in re.finditer(pattern, body):
+                            sec_val = match.group(1) if match.groups() else match.group(0)
+                            self.store.add_secret(sec_val, label, r_url)
+                            self.emit.finding("SECRET", "HIGH", f"{label} leaked in API response: {sec_val[:40]}")
+
+                    # 4. Trigger Extractor to parse PII, emails, tokens & secrets from response body
+                    Extractor.extract_data(body, r_url, self.store, self.emit)
+
+                except Exception:
+                    pass
+
+            page.on("request", _on_request)
+            page.on("response", _on_response)
+
+            visited_urls = set()
+            queue = list(pages)
+
+            while queue:
+                url = queue.pop(0)
+                self._current_page_url = url
+                norm_u = url.split("?")[0].rstrip("/")
+
+                if norm_u in visited_urls:
+                    continue
+                visited_urls.add(norm_u)
+
+                self._pages_visited += 1
+                self.emit.info(f"[DeepSPA] ({self._pages_visited}/{len(visited_urls) + len(queue)}) {url}")
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.8)
+
+                    # ── Harvest dynamic links from live DOM ──
+                    try:
+                        dom_links = await page.evaluate("""
+                            () => Array.from(document.querySelectorAll('[href],[src],[action],[data-route]'))
+                                .map(e => e.href || e.src || e.action || e.getAttribute('data-route'))
+                                .filter(u => u && (u.startsWith('/') || u.startsWith('http')))
+                        """)
+                        for link in (dom_links or []):
+                            full_u = urljoin(url, link) if link.startswith("/") else link
+                            if self.is_valid(full_u):
+                                self.store.add_endpoint(full_u, source="DeepSPA_DOM", score=Conf.MEDIUM)
+                                is_api = bool(re.search(r'/api/|/v\d+/|\.json$|\.js$|\.xml$', full_u, re.I))
+                                norm_link = full_u.split("?")[0].rstrip("/")
+                                if not is_api and norm_link not in visited_urls and full_u not in queue:
+                                    queue.append(full_u)
+                    except Exception:
+                        pass
+
+                    # ── Click interactive elements (tabs, menu items, sub-route links) ──
+                    for sel in ["[role='menuitem']", "[role='tab']", ".nav-item", ".nav-link", "button:not([disabled])"]:
+                        try:
+                            elements = await page.query_selector_all(sel)
+                            for el in elements[:6]:
+                                if await el.is_visible():
+                                    await el.click(timeout=1200)
+                                    await asyncio.sleep(0.3)
+                        except Exception:
+                            pass
+
+                except Exception as e:
+                    self.emit.info(f"[DeepSPA] Navigation warning for {url}: {e}")
+                    continue
+
+            await browser.close()
+            await pw.stop()
+
+            self.emit.always_info(
+                f"[DeepSPA] Done — visited {self._pages_visited} page(s), "
+                f"captured {self._found} background request(s)")
+
+        except Exception as e:
+            self.emit.warn(f"[DeepSPA] Error: {type(e).__name__} {e}")
+
+
                                                                         
                          
                                                                         
@@ -6981,7 +7327,7 @@ class Spider:
         if _SOCKETIO_RE.search(url):
             self.store.add_socketio(url)
             return False
-        if self.cfg.enable_noise_filter and _NOISE_PATH_RE.search(p.path):
+        if self.cfg.enable_noise_filter and _is_noise_path(p.path):
             return False
         return bool(p.scheme in ("http","https"))
 
@@ -8318,6 +8664,19 @@ class Spider:
                     _t_crawl = time.time() - _t_phase_start
                     _t_phase_start = time.time()
                                               
+                # ── Deep SPA: multi-page Playwright crawl ──────────────
+                # After BFS crawl completes, revisit every discovered
+                # HTML page in a real browser to capture background
+                # XHR/fetch requests (the "Network tab" view).
+                if self.cfg.enable_deep_spa and self.cfg.use_playwright:
+                    self.emit.animator.start_anim("DeepSPA Multi-Page Crawl")
+                    deep_spa = DeepSPACrawler(
+                        self.target, self.store, self.emit,
+                        self.cookies, self.extra_headers, self.is_valid
+                    )
+                    await deep_spa.run()
+                    self.emit.animator.stop_anim()
+
                 if self.cfg.enable_probing:
                     prober = IntelligentProber(session, self.store, self.emit, self.rl, self.cfg)
                     await prober.run()
@@ -8684,6 +9043,11 @@ def _build_parser() -> argparse.ArgumentParser:
                             "an external API round trip)")
     flags.add_argument("--spa-interact",  "-I", action="store_true",
                        help="Enable SPA form filling and button clicking (authorized targets only)")
+    flags.add_argument("--deep-spa",      "-J", action="store_true",
+                       help="After crawling, revisit every discovered page in a real browser to "
+                            "capture background XHR/fetch API calls (like viewing the Network tab). "
+                            "Best for smaller targets with few pages — captures API endpoints that "
+                            "only fire when JS executes (login flows, data-fetching, etc.)")
     flags.add_argument("--no-cors",       "-R", action="store_true",
                        help="Disable CORS misconfiguration checks")
     flags.add_argument("--no-graphql",    "-G", action="store_true",
@@ -8849,6 +9213,7 @@ def main():
         verbose         = args.verbose,
         use_playwright  = not args.no_playwright,
         enable_spa_interact = args.spa_interact,
+        enable_deep_spa     = args.deep_spa,
         enable_probing  = args.probe,
         enable_admin_probe     = args.admin_probe,
         enable_sensitive_probe = args.sensitive_probe,
