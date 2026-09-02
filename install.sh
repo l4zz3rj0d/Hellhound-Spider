@@ -103,6 +103,21 @@ if [ ! -d "$VENV_DIR" ]; then
     python3 -m venv "$VENV_DIR" || error "Failed to create virtual environment. Ensure 'python3-venv' is installed."
 fi
 VENV_PYTHON="$VENV_DIR/bin/python3"
+
+if ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
+    info "pip is missing from the virtual environment; bootstrapping it..."
+    if ! "$VENV_PYTHON" -m ensurepip --upgrade >/dev/null 2>&1; then
+        if command -v apt-get &>/dev/null; then
+            if [ "$EUID" -eq 0 ]; then
+                apt-get update -qq && apt-get install -y -qq python3-venv python3-pip >/dev/null 2>&1 || true
+            elif command -v sudo &>/dev/null; then
+                sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv python3-pip >/dev/null 2>&1 || true
+            fi
+        fi
+        "$VENV_PYTHON" -m ensurepip --upgrade || error "pip could not be installed in the virtual environment. Install 'python3-venv' (and 'python3-pip' on Debian/Ubuntu) and retry."
+    fi
+fi
+
 stop_animation
 success "Virtual environment ready: $VENV_DIR"
 
